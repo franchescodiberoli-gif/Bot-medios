@@ -11,9 +11,11 @@ PLATFORM_PATTERNS = {
         r"vt\.tiktok\.com\/",
     ],
     "facebook": [
-        r"facebook\.com\/(watch|reel|share\/v|video\.php)",
+        r"facebook\.com\/(watch|reel|video\.php)",
+        r"facebook\.com\/share\/(v|p|r|reels)\/",
+        r"facebook\.com\/[^/?]+\/(videos|reels)\/",
+        r"facebook\.com\/reel\/",
         r"fb\.watch\/",
-        r"fb\.com\/",
     ],
     "youtube_short": [
         r"youtube\.com\/shorts\/",
@@ -22,22 +24,24 @@ PLATFORM_PATTERNS = {
     "youtube_long": [
         r"youtube\.com\/watch\?v=",
         r"youtube\.com\/live\/",
+        r"youtube\.com\/embed\/",
     ],
     "reddit": [
         r"reddit\.com\/r\/.+\/comments\/",
         r"redd\.it\/",
-        r"redgifs\.com\/watch\/",
         r"v\.redd\.it\/",
         r"i\.redd\.it\/",
+    ],
+    "redgifs": [
+        r"redgifs\.com\/watch\/",
     ],
     "twitter": [
         r"twitter\.com\/.+\/status\/",
         r"x\.com\/.+\/status\/",
-        r"t\.co\/",
     ],
     "threads": [
         r"threads\.net\/@.+\/post\/",
-        r"threads\.com\/",
+        r"threads\.com\/@.+\/post\/",
     ],
 }
 
