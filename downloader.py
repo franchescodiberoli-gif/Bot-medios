@@ -54,6 +54,8 @@ def _base_ydl_opts(output_dir: str, platform: str = None) -> dict:
         "format": "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=webm]/best",
         "noplaylist": True,
         "socket_timeout": 30,
+        "extractor_args": {"youtube": {"player_client": ["ios", "mweb"]}},
+        "http_headers": {"User-Agent": "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)"},
     }
     cookies = _get_cookies_file(platform)
     if cookies:
