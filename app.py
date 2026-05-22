@@ -1,7 +1,7 @@
 import streamlit as st
-import threading
 import os
 import sys
+import subprocess
 
 st.set_page_config(page_title="MediaBot", page_icon="🤖", layout="centered")
 
@@ -38,15 +38,29 @@ st.markdown("---")
 st.caption("Powered by yt-dlp · python-telegram-bot · Streamlit")
 
 
-def run_bot():
-    try:
-        import subprocess
-        subprocess.Popen([sys.executable, "bot.py"])
-    except Exception as e:
-        st.error(f"Error al iniciar el bot: {e}")
+def is_bot_running() -> bool:
+    """Check if bot.py is already running using a PID file."""
+    pid_file = "/tmp/mediabot.pid"
+    if os.path.exists(pid_file):
+        try:
+            with open(pid_file, "r") as f:
+                pid = int(f.read().strip())
+            # Check if that process is still alive
+            os.kill(pid, 0)
+            return True  # Process exists
+        except (OSError, ValueError):
+            # Process is dead — remove stale PID file
+            os.remove(pid_file)
+    return False
 
 
-if "bot_started" not in st.session_state:
-    st.session_state["bot_started"] = True
-    bot_thread = threading.Thread(target=run_bot, daemon=True)
-    bot_thread.start()
+def start_bot():
+    """Start bot.py as a subprocess and save its PID."""
+    pid_file = "/tmp/mediabot.pid"
+    proc = subprocess.Popen([sys.executable, "bot.py"])
+    with open(pid_file, "w") as f:
+        f.write(str(proc.pid))
+
+
+if not is_bot_running():
+    start_bot()
