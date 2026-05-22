@@ -38,7 +38,6 @@ def _get_cookies_file(platform: str = None) -> str | None:
     if COOKIES_FILE and os.path.exists(COOKIES_FILE):
         return COOKIES_FILE
     if platform == "instagram" and INSTAGRAM_COOKIES:
-        # Always rewrite to avoid stale file
         if os.path.exists(_INSTAGRAM_COOKIES_PATH):
             os.remove(_INSTAGRAM_COOKIES_PATH)
         return _write_instagram_cookies()
@@ -51,10 +50,16 @@ def _base_ydl_opts(output_dir: str, platform: str = None) -> dict:
         "quiet": True,
         "no_warnings": True,
         "merge_output_format": "mp4",
-        "format": "bestvideo+bestaudio/best",
+        "format": (
+            "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]"
+            "/bestvideo[height<=1080]+bestaudio"
+            "/bestvideo+bestaudio"
+            "/best[ext=mp4]"
+            "/best"
+        ),
         "noplaylist": True,
         "socket_timeout": 30,
-        "extractor_args": {"youtube": {"player_client": ["ios", "mweb"]}},
+        "extractor_args": {"youtube": {"player_client": ["ios", "web", "mweb"]}},
         "http_headers": {"User-Agent": "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)"},
     }
     cookies = _get_cookies_file(platform)
