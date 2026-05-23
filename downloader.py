@@ -50,12 +50,11 @@ def _cookies(platform: str) -> str | None:
             return _write_cookies(content, _PATHS[key])
     return None
 
-# YouTube: 3 strategies in order
+# YouTube strategies — ordered from most to least server-friendly
 _YT_STRATEGIES = [
-    # (client_list, format_str)
-    (["web"],              "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"),
-    (["tv"],               "best"),
-    (["tv_embedded","ios"],"best"),
+    (["android_vr"],          "best"),
+    (["android"],             "best[ext=mp4]/best"),
+    (["tv_embedded", "tv"],   "best"),
 ]
 
 def _ydl_opts(output_dir: str, platform: str, attempt: int = 0) -> dict:
@@ -73,7 +72,7 @@ def _ydl_opts(output_dir: str, platform: str, attempt: int = 0) -> dict:
         opts["cookiefile"] = cookies
 
     if platform in ("youtube_short", "youtube_long"):
-        clients, fmt = _YT_STRATEGIES[attempt]
+        clients, fmt = _YT_STRATEGIES[attempt % len(_YT_STRATEGIES)]
         opts["format"] = fmt
         opts["extractor_args"] = {"youtube": {"player_client": clients}}
 
@@ -83,9 +82,9 @@ def download_media(url: str, platform: str = None) -> tuple[str | None, dict | N
     if "threads.com" in url:
         url = url.replace("threads.com", "threads.net")
 
-    n_attempts = len(_YT_STRATEGIES) if platform in ("youtube_short","youtube_long") else 2
+    n = len(_YT_STRATEGIES) if platform in ("youtube_short", "youtube_long") else 2
 
-    for attempt in range(n_attempts):
+    for attempt in range(n):
         tmp_dir = tempfile.mkdtemp()
         try:
             with yt_dlp.YoutubeDL(_ydl_opts(tmp_dir, platform, attempt)) as ydl:
@@ -97,9 +96,9 @@ def download_media(url: str, platform: str = None) -> tuple[str | None, dict | N
         except Exception as e:
             err = str(e)
             logger.error(f"download attempt {attempt+1} error: {err}")
-            if "DRM" in err:
-                return None, None   # undownloadable, stop immediately
-            if attempt == n_attempts - 1:
+            if "DRM" in err and attempt < n - 1:
+                continue
+            if attempt == n - 1:
                 return None, None
 
     return None, None
