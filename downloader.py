@@ -38,11 +38,11 @@ def _cookies(platform: str) -> str | None:
     if COOKIES_FILE and os.path.exists(COOKIES_FILE):
         return COOKIES_FILE
     mapping = {
-        "instagram":    (INSTAGRAM_COOKIES, "instagram"),
-        "youtube_short":(YOUTUBE_COOKIES,   "youtube"),
-        "youtube_long": (YOUTUBE_COOKIES,   "youtube"),
-        "reddit":       (REDDIT_COOKIES,    "reddit"),
-        "redgifs":      (REDGIFS_COOKIES,   "redgifs"),
+        "instagram":     (INSTAGRAM_COOKIES, "instagram"),
+        "youtube_short": (YOUTUBE_COOKIES,   "youtube"),
+        "youtube_long":  (YOUTUBE_COOKIES,   "youtube"),
+        "reddit":        (REDDIT_COOKIES,    "reddit"),
+        "redgifs":       (REDGIFS_COOKIES,   "redgifs"),
     }
     if platform in mapping:
         content, key = mapping[platform]
@@ -50,23 +50,31 @@ def _cookies(platform: str) -> str | None:
             return _write_cookies(content, _PATHS[key])
     return None
 
-def _ydl_opts(output_dir: str, platform: str, attempt: int = 1) -> dict:
+# YouTube: 3 strategies in order
+_YT_STRATEGIES = [
+    # (client_list, format_str)
+    (["web"],              "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"),
+    (["tv"],               "best"),
+    (["tv_embedded","ios"],"best"),
+]
+
+def _ydl_opts(output_dir: str, platform: str, attempt: int = 0) -> dict:
     opts = {
-        "outtmpl":            os.path.join(output_dir, "%(id)s.%(ext)s"),
-        "quiet":              True,
-        "no_warnings":        True,
-        "merge_output_format":"mp4",
-        "noplaylist":         True,
-        "socket_timeout":     30,
-        "format":             "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "outtmpl":             os.path.join(output_dir, "%(id)s.%(ext)s"),
+        "quiet":               True,
+        "no_warnings":         True,
+        "merge_output_format": "mp4",
+        "noplaylist":          True,
+        "socket_timeout":      30,
+        "format":              "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
     }
     cookies = _cookies(platform)
     if cookies:
         opts["cookiefile"] = cookies
 
     if platform in ("youtube_short", "youtube_long"):
-        opts["format"] = "best"
-        clients = ["tv", "ios"] if attempt == 1 else ["web", "tv_embedded"]
+        clients, fmt = _YT_STRATEGIES[attempt]
+        opts["format"] = fmt
         opts["extractor_args"] = {"youtube": {"player_client": clients}}
 
     return opts
@@ -75,7 +83,9 @@ def download_media(url: str, platform: str = None) -> tuple[str | None, dict | N
     if "threads.com" in url:
         url = url.replace("threads.com", "threads.net")
 
-    for attempt in (1, 2):
+    n_attempts = len(_YT_STRATEGIES) if platform in ("youtube_short","youtube_long") else 2
+
+    for attempt in range(n_attempts):
         tmp_dir = tempfile.mkdtemp()
         try:
             with yt_dlp.YoutubeDL(_ydl_opts(tmp_dir, platform, attempt)) as ydl:
@@ -86,11 +96,12 @@ def download_media(url: str, platform: str = None) -> tuple[str | None, dict | N
                         return fp, info
         except Exception as e:
             err = str(e)
-            logger.error(f"download attempt {attempt} error: {err}")
+            logger.error(f"download attempt {attempt+1} error: {err}")
             if "DRM" in err:
+                return None, None   # undownloadable, stop immediately
+            if attempt == n_attempts - 1:
                 return None, None
-            if attempt == 2:
-                return None, None
+
     return None, None
 
 def download_reddit_image(url: str) -> tuple[str | None, dict | None]:
