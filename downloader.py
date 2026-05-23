@@ -14,23 +14,17 @@ _INSTAGRAM_COOKIES_PATH = "/tmp/instagram_cookies.txt"
 
 
 def _write_instagram_cookies():
-    """Write cookies from env var to a proper Netscape format file."""
     if not INSTAGRAM_COOKIES:
         return None
-
     lines = INSTAGRAM_COOKIES.strip().splitlines()
-    
-    # Build valid Netscape file
     output = ["# Netscape HTTP Cookie File"]
     for line in lines:
         line = line.strip()
         if not line or line.startswith("#"):
             continue
         output.append(line)
-
     with open(_INSTAGRAM_COOKIES_PATH, "w") as f:
         f.write("\n".join(output) + "\n")
-
     return _INSTAGRAM_COOKIES_PATH
 
 
@@ -44,48 +38,57 @@ def _get_cookies_file(platform: str = None) -> str | None:
     return None
 
 
-def _base_ydl_opts(output_dir: str, platform: str = None) -> dict:
-    opts = {
+def _ydl_opts_for(output_dir: str, platform: str = None, attempt: int = 1) -> dict:
+    """Return yt-dlp options. attempt=1 is default, attempt=2 is fallback."""
+    base = {
         "outtmpl": os.path.join(output_dir, "%(id)s.%(ext)s"),
         "quiet": True,
         "no_warnings": True,
         "merge_output_format": "mp4",
-        "format": (
-            "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]"
-            "/bestvideo[height<=1080]+bestaudio"
-            "/bestvideo+bestaudio"
-            "/best[ext=mp4]"
-            "/best"
-        ),
         "noplaylist": True,
         "socket_timeout": 30,
-        "extractor_args": {"youtube": {"player_client": ["ios", "web", "mweb"]}},
-        "http_headers": {"User-Agent": "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)"},
     }
+
     cookies = _get_cookies_file(platform)
     if cookies:
-        opts["cookiefile"] = cookies
-    return opts
+        base["cookiefile"] = cookies
+
+    if platform in ("youtube_short", "youtube_long"):
+        if attempt == 1:
+            # tv client — works on servers, no bot detection
+            base["format"] = "best"
+            base["extractor_args"] = {"youtube": {"player_client": ["tv"]}}
+        else:
+            # web client fallback
+            base["format"] = "best"
+            base["extractor_args"] = {"youtube": {"player_client": ["web", "tv_embedded"]}}
+    else:
+        base["format"] = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+
+    return base
 
 
 def download_media(url: str, platform: str = None) -> tuple[str | None, dict | None]:
     if "threads.com" in url:
         url = url.replace("threads.com", "threads.net")
 
-    tmp_dir = tempfile.mkdtemp()
-    ydl_opts = _base_ydl_opts(tmp_dir, platform)
+    # Try up to 2 attempts with different options
+    for attempt in (1, 2):
+        tmp_dir = tempfile.mkdtemp()
+        ydl_opts = _ydl_opts_for(tmp_dir, platform, attempt)
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                for f in os.listdir(tmp_dir):
+                    full_path = os.path.join(tmp_dir, f)
+                    if os.path.isfile(full_path):
+                        return full_path, info
+        except Exception as e:
+            logger.error(f"download_media attempt {attempt} error: {e}")
+            if attempt == 2:
+                return None, None
 
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            for f in os.listdir(tmp_dir):
-                full_path = os.path.join(tmp_dir, f)
-                if os.path.isfile(full_path):
-                    return full_path, info
-        return None, None
-    except Exception as e:
-        logger.error(f"download_media error: {e}")
-        return None, None
+    return None, None
 
 
 def download_reddit_image(url: str) -> tuple[str | None, dict | None]:
