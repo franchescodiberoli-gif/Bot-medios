@@ -5,7 +5,6 @@ import tempfile
 import logging
 import requests
 import warnings
-import urllib.parse
 warnings.filterwarnings("ignore", message="Unverified HTTPS request")
 
 logger = logging.getLogger(__name__)
@@ -16,6 +15,7 @@ REDDIT_COOKIES    = os.environ.get("REDDIT_COOKIES",    None)
 REDGIFS_COOKIES   = os.environ.get("REDGIFS_COOKIES",   None)
 COOKIES_FILE      = os.environ.get("COOKIES_FILE",      None)
 
+# ─── Proxy residencial SOCKS5 ─────────────────────────────────────
 PROXY = "socks5://Ot1bKeBOWiEOWQ2:nXx63GvaccqaYB2@178.93.24.237:42342"
 PROXIES = {"http": PROXY, "https": PROXY}
 
@@ -25,6 +25,7 @@ _PATHS = {
     "reddit":    "/tmp/rd_cookies.txt",
     "redgifs":   "/tmp/rg_cookies.txt",
 }
+
 
 def _write_cookies(content: str, path: str) -> str | None:
     if not content:
@@ -39,6 +40,7 @@ def _write_cookies(content: str, path: str) -> str | None:
     with open(path, "w") as f:
         f.write("\n".join(lines) + "\n")
     return path
+
 
 def _cookies(platform: str) -> str | None:
     if COOKIES_FILE and os.path.exists(COOKIES_FILE):
@@ -56,6 +58,7 @@ def _cookies(platform: str) -> str | None:
             return _write_cookies(content, _PATHS[key])
     return None
 
+
 def _extract_video_id(url: str) -> str | None:
     for pat in [
         r"v=([a-zA-Z0-9_-]{11})",
@@ -69,6 +72,11 @@ def _extract_video_id(url: str) -> str | None:
             return m.group(1)
     return None
 
+
+# ═══════════════════════════════════════════════════════════════════
+# ESTRATEGIA 1: cobalt.tools (vía proxy)
+# ═══════════════════════════════════════════════════════════════════
+
 COBALT_INSTANCES = [
     "https://api.cobalt.tools",
     "https://cobalt.api.timelessnesses.me",
@@ -76,6 +84,7 @@ COBALT_INSTANCES = [
     "https://cobalt.datura.network",
     "https://cobalt.svaba.site",
 ]
+
 
 def _download_direct_url(url: str, ext: str = "mp4") -> str | None:
     try:
@@ -93,6 +102,7 @@ def _download_direct_url(url: str, ext: str = "mp4") -> str | None:
         logger.warning(f"  _download_direct_url: {e}")
     return None
 
+
 def _try_cobalt(url: str) -> tuple[str | None, dict | None]:
     headers = {
         "Content-Type": "application/json",
@@ -100,25 +110,37 @@ def _try_cobalt(url: str) -> tuple[str | None, dict | None]:
         "User-Agent": "MediaBot/2.0",
     }
     payload = {"url": url}
+
     for instance in COBALT_INSTANCES:
         try:
+            logger.info(f"→ cobalt [{instance}]...")
             r = requests.post(
                 instance, json=payload, headers=headers,
                 timeout=25, proxies=PROXIES, verify=False
             )
-            if r.status_code == 429 or r.status_code != 200:
+            if r.status_code == 429:
+                logger.warning(f"  cobalt {instance} → rate limit")
                 continue
+            if r.status_code != 200:
+                logger.warning(f"  cobalt {instance} → HTTP {r.status_code}")
+                continue
+
             data = r.json()
             status = data.get("status", "")
+
             if status in ("stream", "tunnel", "redirect") and data.get("url"):
                 fp = _download_direct_url(data["url"], "mp4")
                 if fp:
                     vid_id = _extract_video_id(url) or "video"
                     info = {
-                        "id": vid_id, "title": data.get("filename", vid_id),
-                        "webpage_url": url, "extractor_key": "Youtube",
+                        "id": vid_id,
+                        "title": data.get("filename", vid_id),
+                        "webpage_url": url,
+                        "extractor_key": "Youtube",
                     }
+                    logger.info(f"✅ cobalt OK [{instance}]")
                     return fp, info
+
             if status == "picker" and data.get("picker"):
                 for item in data["picker"]:
                     if item.get("url"):
@@ -129,38 +151,65 @@ def _try_cobalt(url: str) -> tuple[str | None, dict | None]:
                                 "id": vid_id, "title": vid_id,
                                 "webpage_url": url, "extractor_key": "Youtube"
                             }
-        except Exception:
-            pass
+
+            if status == "error":
+                code = data.get("error", {}).get("code", "?")
+                logger.warning(f"  cobalt {instance} → error: {code}")
+
+        except requests.exceptions.Timeout:
+            logger.warning(f"  cobalt {instance} → timeout")
+        except Exception as e:
+            logger.warning(f"  cobalt {instance} → {e}")
+
     return None, None
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ESTRATEGIA 2: yt-dlp con proxy
+# ═══════════════════════════════════════════════════════════════════
 
 def _get_js_runtimes() -> dict:
     import shutil
     node_path = shutil.which("node") or shutil.which("nodejs") or "/usr/bin/nodejs"
     return {"node": {"path": node_path}}
 
+
 def _ytdlp_download(url: str, client: str, cookies: str | None) -> tuple[str | None, dict | None]:
     tmp_dir = tempfile.mkdtemp()
     opts = {
-        "quiet": True, "no_warnings": True, "merge_output_format": "mp4",
-        "noplaylist": True, "socket_timeout": 60, "nocheckcertificate": True,
-        "format": "best[height<=720]/best", "js_runtimes": _get_js_runtimes(),
-        "outtmpl": os.path.join(tmp_dir, "%(id)s.%(ext)s"),
-        "extractor_args": {"youtube": {"player_client": [client]}},
-        "proxy": PROXY,
+        "quiet":               True,
+        "no_warnings":         True,
+        "merge_output_format": "mp4",
+        "noplaylist":          True,
+        "socket_timeout":      60,
+        "nocheckcertificate":  True,
+        "format":              "best[height<=720]/best",
+        "js_runtimes":         _get_js_runtimes(),
+        "outtmpl":             os.path.join(tmp_dir, "%(id)s.%(ext)s"),
+        "extractor_args":      {"youtube": {"player_client": [client]}},
+        "proxy":               PROXY,
     }
     if cookies:
         opts["cookiefile"] = cookies
+
     try:
+        logger.info(f"→ yt-dlp [{client}] + proxy...")
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
             for f in os.listdir(tmp_dir):
                 fp = os.path.join(tmp_dir, f)
                 if os.path.isfile(fp) and os.path.getsize(fp) > 10_000:
+                    logger.info(f"✅ yt-dlp OK [{client}]")
                     return fp, info
     except Exception as e:
-        if "Private video" in str(e) or "private" in str(e).lower():
+        err = str(e)
+        if "Private video" in err or "private" in err.lower():
+            logger.error(f"[{client}] Video privado")
             return "PRIVATE", None
+        logger.warning(f"[{client}] {err[:120]}")
+
     return None, None
+
 
 def _try_ytdlp_all(url: str, cookies: str | None) -> tuple[str | None, dict | None]:
     for client in ["tv_embedded", "mweb", "ios", "web"]:
@@ -171,27 +220,50 @@ def _try_ytdlp_all(url: str, cookies: str | None) -> tuple[str | None, dict | No
             return fp, info
     return None, None
 
+
+# ═══════════════════════════════════════════════════════════════════
+# Función principal YouTube
+# ═══════════════════════════════════════════════════════════════════
+
 def download_youtube(url: str, platform: str) -> tuple[str | None, dict | None]:
     cookies = _cookies(platform)
+
+    logger.info("🔄 [1/2] cobalt.tools + proxy...")
     fp, info = _try_cobalt(url)
-    if fp: return fp, info
+    if fp:
+        return fp, info
+
+    logger.info("🔄 [2/2] yt-dlp + proxy...")
     fp, info = _try_ytdlp_all(url, cookies)
-    if fp: return fp, info
+    if fp:
+        return fp, info
+
+    logger.error(f"❌ Todas las estrategias fallaron: {url}")
     return None, None
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Descargador genérico (non-YouTube) — también usa proxy para Reddit
+# ═══════════════════════════════════════════════════════════════════
 
 def download_media(url: str, platform: str = None) -> tuple[str | None, dict | None]:
     if "threads.com" in url:
         url = url.replace("threads.com", "threads.net")
+
     if platform in ("youtube_short", "youtube_long"):
         return download_youtube(url, platform)
 
     tmp_dir = tempfile.mkdtemp()
     opts = {
-        "outtmpl": os.path.join(tmp_dir, "%(id)s.%(ext)s"),
-        "quiet": True, "no_warnings": True, "merge_output_format": "mp4",
-        "noplaylist": True, "socket_timeout": 30, "nocheckcertificate": True,
-        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-        "proxy": PROXY,
+        "outtmpl":             os.path.join(tmp_dir, "%(id)s.%(ext)s"),
+        "quiet":               True,
+        "no_warnings":         True,
+        "merge_output_format": "mp4",
+        "noplaylist":          True,
+        "socket_timeout":      30,
+        "nocheckcertificate":  True,
+        "format":              "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "proxy":               PROXY,
     }
     cookies = _cookies(platform)
     if cookies:
@@ -206,44 +278,28 @@ def download_media(url: str, platform: str = None) -> tuple[str | None, dict | N
                     return fp, info
     except Exception as e:
         logger.error(f"download_media error: {e}")
+
     return None, None
 
-def download_reddit_image(url: str) -> tuple[str | list | None, dict | None]:
-    try:
-        # Extraer la URL real si es un link /media
-        if "/media" in url and "url=" in url:
-            parsed = urllib.parse.urlparse(url)
-            qs = urllib.parse.parse_qs(parsed.query)
-            if "url" in qs:
-                url = qs["url"][0]
 
+# ═══════════════════════════════════════════════════════════════════
+# Reddit image fallback — con proxy
+# ═══════════════════════════════════════════════════════════════════
+
+def download_reddit_image(url: str) -> tuple[str | None, dict | None]:
+    try:
         clean = url.split("?")[0].rstrip("/")
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Accept": "application/json",
         }
-        resp = requests.get(clean + ".json", headers=headers, proxies=PROXIES, timeout=15)
+        resp = requests.get(clean + ".json", headers=headers,
+                            proxies=PROXIES, timeout=15)
         resp.raise_for_status()
         post = resp.json()[0]["data"]["children"][0]["data"]
         title = post.get("title", "Reddit post")
-
-        # GALERÍAS (Retorna una lista de archivos)
-        if post.get("is_gallery") and post.get("media_metadata"):
-            files = []
-            for media_id, media in post["media_metadata"].items():
-                if media.get("status") == "valid":
-                    img_url = media.get("s", {}).get("u", "").replace("&amp;", "&")
-                    if img_url:
-                        r = requests.get(img_url, headers=headers, proxies=PROXIES, timeout=30)
-                        tmp = os.path.join(tempfile.mkdtemp(), f"reddit_{media_id}.jpg")
-                        with open(tmp, "wb") as f:
-                            f.write(r.content)
-                        files.append(tmp)
-            if files:
-                return files, {"title": title, "webpage_url": url, "ext": "gallery", "extractor_key": "Reddit", "is_gallery": True}
-
-        # IMAGEN ÚNICA FALLBACK
         img_url = post.get("url_overridden_by_dest", "")
+
         if img_url and any(img_url.lower().endswith(e) for e in [".jpg", ".jpeg", ".png", ".gif", ".webp"]):
             ext = img_url.split(".")[-1].split("?")[0].lower()
             r = requests.get(img_url, headers=headers, proxies=PROXIES, timeout=30)
@@ -253,14 +309,30 @@ def download_reddit_image(url: str) -> tuple[str | list | None, dict | None]:
                 f.write(r.content)
             return tmp, {"title": title, "webpage_url": url, "ext": ext, "extractor_key": "Reddit"}
 
+        if post.get("is_gallery") and post.get("media_metadata"):
+            for _, media in post["media_metadata"].items():
+                if media.get("status") == "valid":
+                    img_url = media.get("s", {}).get("u", "").replace("&amp;", "&")
+                    if img_url:
+                        r = requests.get(img_url, headers=headers, proxies=PROXIES, timeout=30)
+                        tmp = os.path.join(tempfile.mkdtemp(), "reddit.jpg")
+                        with open(tmp, "wb") as f:
+                            f.write(r.content)
+                        return tmp, {"title": title, "webpage_url": url, "ext": "jpg", "extractor_key": "Reddit"}
     except Exception as e:
         logger.error(f"download_reddit_image error: {e}")
     return None, None
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Helpers
+# ═══════════════════════════════════════════════════════════════════
 
 def clean_hashtags(text: str) -> str:
     if not text:
         return ""
     return " ".join(re.findall(r"#\w+", text))
+
 
 def get_clean_url(info: dict) -> str:
     webpage     = info.get("webpage_url", "")
