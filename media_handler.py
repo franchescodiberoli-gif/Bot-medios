@@ -31,12 +31,19 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.chat.send_action(ChatAction.UPLOAD_VIDEO)
-    processing_msg = await update.message.reply_text("⏳ Descargando contenido...")
+
+    if platform in ("youtube_short", "youtube_long"):
+        processing_msg = await update.message.reply_text(
+            "⏳ Descargando video de YouTube...\n"
+            "_(Puede tardar unos segundos, probando múltiples métodos)_",
+            parse_mode="Markdown",
+        )
+    else:
+        processing_msg = await update.message.reply_text("⏳ Descargando contenido...")
 
     try:
         file_path, info = download_media(url, platform)
 
-        # Reddit fallback: if yt-dlp fails, try JSON API for images
         if (not file_path) and platform in ("reddit",):
             file_path, info = download_reddit_image(url)
 
@@ -48,8 +55,6 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         clean_url = get_clean_url(info)
-
-        # Use "redgifs" formatter key for redgifs platform
         formatter_key = "reddit" if platform == "redgifs" else platform
         caption_text = format_message(formatter_key, info, clean_url)
 
@@ -70,8 +75,8 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
         elif file_size_mb > MAX_FILE_SIZE_MB:
             await update.message.reply_text(
-                f"⚠️ El archivo pesa más de {MAX_FILE_SIZE_MB}MB, no puedo enviarlo directamente.\n\n"
-                + caption_text,
+                f"⚠️ El archivo pesa {file_size_mb:.1f}MB (máx {MAX_FILE_SIZE_MB}MB), "
+                f"no puedo enviarlo directamente.\n\n" + caption_text,
                 parse_mode="Markdown",
                 disable_web_page_preview=False,
             )
