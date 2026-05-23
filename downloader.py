@@ -15,9 +15,9 @@ REDDIT_COOKIES    = os.environ.get("REDDIT_COOKIES",    None)
 REDGIFS_COOKIES   = os.environ.get("REDGIFS_COOKIES",   None)
 COOKIES_FILE      = os.environ.get("COOKIES_FILE",      None)
 
-# ─── Proxy residencial SOCKS5 ─────────────────────────────────────
-PROXY = "socks5://Ot1bKeBOWiEOWQ2:nXx63GvaccqaYB2@178.93.24.237:42342"
-PROXIES = {"http": PROXY, "https": PROXY}
+# ── Proxy desde Secrets (no hardcodeado) ──────────────────────────
+PROXY   = os.environ.get("PROXY_URL", "")
+PROXIES = {"http": PROXY, "https": PROXY} if PROXY else {}
 
 _PATHS = {
     "instagram": "/tmp/ig_cookies.txt",
@@ -74,7 +74,7 @@ def _extract_video_id(url: str) -> str | None:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# ESTRATEGIA 1: cobalt.tools (vía proxy)
+# ESTRATEGIA 1: cobalt.tools
 # ═══════════════════════════════════════════════════════════════════
 
 COBALT_INSTANCES = [
@@ -99,80 +99,55 @@ def _download_direct_url(url: str, ext: str = "mp4") -> str | None:
         if os.path.getsize(tmp) > 10_000:
             return tmp
     except Exception as e:
-        logger.warning(f"  _download_direct_url: {e}")
+        logger.warning(f"_download_direct_url: {e}")
     return None
 
 
 def _try_cobalt(url: str) -> tuple[str | None, dict | None]:
     headers = {
         "Content-Type": "application/json",
-        "Accept": "application/json",
-        "User-Agent": "MediaBot/2.0",
+        "Accept":       "application/json",
+        "User-Agent":   "MediaBot/2.0",
     }
-    payload = {"url": url}
-
     for instance in COBALT_INSTANCES:
         try:
             logger.info(f"→ cobalt [{instance}]...")
-            r = requests.post(
-                instance, json=payload, headers=headers,
-                timeout=25, proxies=PROXIES, verify=False
-            )
-            if r.status_code == 429:
-                logger.warning(f"  cobalt {instance} → rate limit")
-                continue
+            r = requests.post(instance, json={"url": url}, headers=headers,
+                              timeout=25, proxies=PROXIES, verify=False)
             if r.status_code != 200:
-                logger.warning(f"  cobalt {instance} → HTTP {r.status_code}")
                 continue
-
-            data = r.json()
+            data   = r.json()
             status = data.get("status", "")
 
             if status in ("stream", "tunnel", "redirect") and data.get("url"):
-                fp = _download_direct_url(data["url"], "mp4")
+                fp = _download_direct_url(data["url"])
                 if fp:
                     vid_id = _extract_video_id(url) or "video"
-                    info = {
-                        "id": vid_id,
-                        "title": data.get("filename", vid_id),
-                        "webpage_url": url,
-                        "extractor_key": "Youtube",
+                    return fp, {
+                        "id": vid_id, "title": data.get("filename", vid_id),
+                        "webpage_url": url, "extractor_key": "Youtube",
                     }
-                    logger.info(f"✅ cobalt OK [{instance}]")
-                    return fp, info
 
             if status == "picker" and data.get("picker"):
                 for item in data["picker"]:
                     if item.get("url"):
-                        fp = _download_direct_url(item["url"], item.get("type", "mp4"))
+                        fp = _download_direct_url(item["url"])
                         if fp:
                             vid_id = _extract_video_id(url) or "video"
                             return fp, {
                                 "id": vid_id, "title": vid_id,
-                                "webpage_url": url, "extractor_key": "Youtube"
+                                "webpage_url": url, "extractor_key": "Youtube",
                             }
-
             if status == "error":
-                code = data.get("error", {}).get("code", "?")
-                logger.warning(f"  cobalt {instance} → error: {code}")
-
-        except requests.exceptions.Timeout:
-            logger.warning(f"  cobalt {instance} → timeout")
+                logger.warning(f"cobalt {instance} → {data.get('error', {}).get('code','?')}")
         except Exception as e:
-            logger.warning(f"  cobalt {instance} → {e}")
-
+            logger.warning(f"cobalt {instance} → {e}")
     return None, None
 
 
 # ═══════════════════════════════════════════════════════════════════
 # ESTRATEGIA 2: yt-dlp con proxy
 # ═══════════════════════════════════════════════════════════════════
-
-def _get_js_runtimes() -> dict:
-    import shutil
-    node_path = shutil.which("node") or shutil.which("nodejs") or "/usr/bin/nodejs"
-    return {"node": {"path": node_path}}
-
 
 def _ytdlp_download(url: str, client: str, cookies: str | None) -> tuple[str | None, dict | None]:
     tmp_dir = tempfile.mkdtemp()
@@ -184,30 +159,26 @@ def _ytdlp_download(url: str, client: str, cookies: str | None) -> tuple[str | N
         "socket_timeout":      60,
         "nocheckcertificate":  True,
         "format":              "best[height<=720]/best",
-        "js_runtimes":         _get_js_runtimes(),
         "outtmpl":             os.path.join(tmp_dir, "%(id)s.%(ext)s"),
         "extractor_args":      {"youtube": {"player_client": [client]}},
-        "proxy":               PROXY,
     }
+    if PROXY:
+        opts["proxy"] = PROXY
     if cookies:
         opts["cookiefile"] = cookies
-
     try:
-        logger.info(f"→ yt-dlp [{client}] + proxy...")
+        logger.info(f"→ yt-dlp [{client}]...")
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
             for f in os.listdir(tmp_dir):
                 fp = os.path.join(tmp_dir, f)
                 if os.path.isfile(fp) and os.path.getsize(fp) > 10_000:
-                    logger.info(f"✅ yt-dlp OK [{client}]")
                     return fp, info
     except Exception as e:
         err = str(e)
-        if "Private video" in err or "private" in err.lower():
-            logger.error(f"[{client}] Video privado")
+        if "DRM" in err or "private" in err.lower():
             return "PRIVATE", None
-        logger.warning(f"[{client}] {err[:120]}")
-
+        logger.warning(f"yt-dlp [{client}]: {err[:120]}")
     return None, None
 
 
@@ -222,28 +193,19 @@ def _try_ytdlp_all(url: str, cookies: str | None) -> tuple[str | None, dict | No
 
 
 # ═══════════════════════════════════════════════════════════════════
-# Función principal YouTube
+# YouTube principal
 # ═══════════════════════════════════════════════════════════════════
 
 def download_youtube(url: str, platform: str) -> tuple[str | None, dict | None]:
     cookies = _cookies(platform)
-
-    logger.info("🔄 [1/2] cobalt.tools + proxy...")
     fp, info = _try_cobalt(url)
     if fp:
         return fp, info
-
-    logger.info("🔄 [2/2] yt-dlp + proxy...")
-    fp, info = _try_ytdlp_all(url, cookies)
-    if fp:
-        return fp, info
-
-    logger.error(f"❌ Todas las estrategias fallaron: {url}")
-    return None, None
+    return _try_ytdlp_all(url, cookies)
 
 
 # ═══════════════════════════════════════════════════════════════════
-# Descargador genérico (non-YouTube) — también usa proxy para Reddit
+# Descargador genérico
 # ═══════════════════════════════════════════════════════════════════
 
 def download_media(url: str, platform: str = None) -> tuple[str | None, dict | None]:
@@ -263,8 +225,9 @@ def download_media(url: str, platform: str = None) -> tuple[str | None, dict | N
         "socket_timeout":      30,
         "nocheckcertificate":  True,
         "format":              "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-        "proxy":               PROXY,
     }
+    if PROXY:
+        opts["proxy"] = PROXY
     cookies = _cookies(platform)
     if cookies:
         opts["cookiefile"] = cookies
@@ -278,31 +241,26 @@ def download_media(url: str, platform: str = None) -> tuple[str | None, dict | N
                     return fp, info
     except Exception as e:
         logger.error(f"download_media error: {e}")
-
     return None, None
 
 
 # ═══════════════════════════════════════════════════════════════════
-# Reddit image fallback — con proxy
+# Reddit imagen fallback
 # ═══════════════════════════════════════════════════════════════════
 
 def download_reddit_image(url: str) -> tuple[str | None, dict | None]:
     try:
-        clean = url.split("?")[0].rstrip("/")
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "application/json",
-        }
-        resp = requests.get(clean + ".json", headers=headers,
-                            proxies=PROXIES, timeout=15)
+        clean   = url.split("?")[0].rstrip("/")
+        headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+        resp    = requests.get(clean + ".json", headers=headers, proxies=PROXIES, timeout=15)
         resp.raise_for_status()
-        post = resp.json()[0]["data"]["children"][0]["data"]
-        title = post.get("title", "Reddit post")
+        post    = resp.json()[0]["data"]["children"][0]["data"]
+        title   = post.get("title", "Reddit post")
         img_url = post.get("url_overridden_by_dest", "")
 
-        if img_url and any(img_url.lower().endswith(e) for e in [".jpg", ".jpeg", ".png", ".gif", ".webp"]):
+        if img_url and any(img_url.lower().endswith(e) for e in [".jpg",".jpeg",".png",".gif",".webp"]):
             ext = img_url.split(".")[-1].split("?")[0].lower()
-            r = requests.get(img_url, headers=headers, proxies=PROXIES, timeout=30)
+            r   = requests.get(img_url, headers=headers, proxies=PROXIES, timeout=30)
             r.raise_for_status()
             tmp = os.path.join(tempfile.mkdtemp(), f"reddit.{ext}")
             with open(tmp, "wb") as f:
