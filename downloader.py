@@ -67,38 +67,125 @@ def _extract_video_id(url: str) -> str | None:
     return None
 
 
-# ─── YouTube: descarga con yt-dlp + cookies ───────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# ESTRATEGIA 1: cobalt.tools — gratis, sin cookies, para siempre
+# ═══════════════════════════════════════════════════════════════════
+# cobalt es open-source: https://github.com/imputnet/cobalt
+# Instancias públicas gratuitas que no requieren autenticación.
+# Si una falla, prueba la siguiente.
 
-def download_youtube(url: str, platform: str) -> tuple[str | None, dict | None]:
+COBALT_INSTANCES = [
+    "https://api.cobalt.tools",
+    "https://cobalt.api.timelessnesses.me",
+    "https://cob.frytea.com",
+    "https://cobalt.ycnmhvap.dedyn.io",
+    "https://cobalt.gnome.moe",
+]
+
+
+def _download_direct_url(url: str, ext: str = "mp4") -> str | None:
+    """Descarga un archivo desde URL directa."""
+    try:
+        tmp = os.path.join(tempfile.mkdtemp(), f"video.{ext}")
+        hdrs = {"User-Agent": "Mozilla/5.0 (compatible; MediaBot/2.0)"}
+        with requests.get(url, headers=hdrs, stream=True, timeout=120) as r:
+            r.raise_for_status()
+            with open(tmp, "wb") as f:
+                for chunk in r.iter_content(chunk_size=256 * 1024):
+                    f.write(chunk)
+        if os.path.getsize(tmp) > 10_000:
+            return tmp
+    except Exception as e:
+        logger.warning(f"  _download_direct_url: {e}")
+    return None
+
+
+def _try_cobalt(url: str) -> tuple[str | None, dict | None]:
     """
-    Descarga YouTube usando yt-dlp con las cookies del usuario.
-    Las cookies son la clave: con ellas YouTube no bloquea aunque
-    la IP sea de un servidor cloud.
-
-    Probamos varios clientes en orden — cada uno tiene distintas
-    restricciones de formato y bot-detection:
-      - android_vr   : sin SABIS, acepta descarga directa
-      - ios          : cliente móvil, permisivo
-      - tv_simply    : cliente TV, sin bot detection
-      - tv_downgraded: cliente TV legacy
-      - web          : cliente web estándar (requiere cookies sí o sí)
+    Descarga via cobalt.tools API.
+    - Completamente gratuito y open-source
+    - Sin cookies ni autenticación
+    - Funciona desde IPs de servidores cloud
+    - Prueba múltiples instancias si una falla
     """
-    # Escribir cookies PRIMERO antes de cualquier otra cosa
-    cookies = _cookies(platform)
-    if not cookies:
-        logger.warning("⚠️ No hay YOUTUBE_COOKIES configuradas — YouTube probablemente bloqueará")
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "MediaBot/2.0",
+    }
+    payload = {
+        "url": url,
+        "videoQuality": "720",
+        "filenameStyle": "basic",
+        "downloadMode": "auto",
+    }
 
-    # Formato flexible: acepta cualquier contenedor disponible, no solo mp4
-    # Esto evita el error "Requested format is not available"
-    FORMAT = "bestvideo[height<=720]+bestaudio/best[height<=720]/best"
+    for instance in COBALT_INSTANCES:
+        try:
+            logger.info(f"→ cobalt [{instance}]...")
+            r = requests.post(instance, json=payload, headers=headers, timeout=25)
+            if r.status_code == 429:
+                logger.warning(f"  cobalt {instance} → rate limit, siguiente...")
+                continue
+            if r.status_code != 200:
+                logger.warning(f"  cobalt {instance} → HTTP {r.status_code}")
+                continue
 
-    clients_order = [
-        "android_vr",
-        "ios",
-        "tv_simply",
-        "tv_downgraded",
-        "web",
-    ]
+            data = r.json()
+            status = data.get("status", "")
+
+            if status in ("stream", "tunnel", "redirect") and data.get("url"):
+                fp = _download_direct_url(data["url"], "mp4")
+                if fp:
+                    vid_id = _extract_video_id(url) or "video"
+                    info = {
+                        "id": vid_id, "title": data.get("filename", vid_id),
+                        "webpage_url": url, "extractor_key": "Youtube",
+                    }
+                    logger.info(f"✅ cobalt OK [{instance}]")
+                    return fp, info
+
+            if status == "picker" and data.get("picker"):
+                for item in data["picker"]:
+                    if item.get("url"):
+                        fp = _download_direct_url(item["url"], item.get("type", "mp4"))
+                        if fp:
+                            vid_id = _extract_video_id(url) or "video"
+                            return fp, {"id": vid_id, "title": vid_id,
+                                        "webpage_url": url, "extractor_key": "Youtube"}
+
+            if status == "error":
+                logger.warning(f"  cobalt {instance} → error: {data.get('error', {}).get('code', '?')}")
+
+        except requests.exceptions.Timeout:
+            logger.warning(f"  cobalt {instance} → timeout")
+        except Exception as e:
+            logger.warning(f"  cobalt {instance} → {e}")
+
+    return None, None
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ESTRATEGIA 2: yt-dlp con clientes sin PO Token + Node.js runtime
+# ═══════════════════════════════════════════════════════════════════
+# Requiere: nodejs instalado en packages.txt
+# Clientes que NO piden PO Token ni cookies: tv_embedded, mweb, tv
+
+def _try_ytdlp_no_cookies(url: str, cookies: str | None) -> tuple[str | None, dict | None]:
+    """
+    yt-dlp con clientes que no requieren cookies desde cloud IPs.
+    Usa Node.js como runtime de JavaScript (requerido por yt-dlp 2026+).
+    """
+    FORMAT = (
+        "bestvideo[height<=720][vcodec!*=av01]+bestaudio"
+        "/bestvideo[height<=720]+bestaudio"
+        "/best[height<=720]/best"
+    )
+
+    # Detectar ruta de node.js
+    import shutil
+    node_path = shutil.which("node") or shutil.which("nodejs")
+    js_runtimes = f"node:{node_path}" if node_path else "node"
 
     base_opts = {
         "quiet":               True,
@@ -108,18 +195,15 @@ def download_youtube(url: str, platform: str) -> tuple[str | None, dict | None]:
         "socket_timeout":      60,
         "nocheckcertificate":  True,
         "format":              FORMAT,
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5_1 like Mac OS X) "
-                "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Mobile/15E148 Safari/604.1"
-            ),
-        },
+        "js_runtimes":         js_runtimes,  # ← Node.js para yt-dlp 2026+
     }
-
     if cookies:
         base_opts["cookiefile"] = cookies
 
-    for client in clients_order:
+    # tv_embedded: mejor opción, no requiere PO token ni cookies
+    # mweb: mobile web, sin bot detection agresiva
+    # tv: TV estándar
+    for client in ["tv_embedded", "mweb", "tv"]:
         tmp_dir = tempfile.mkdtemp()
         opts = {
             **base_opts,
@@ -127,37 +211,100 @@ def download_youtube(url: str, platform: str) -> tuple[str | None, dict | None]:
             "extractor_args": {"youtube": {"player_client": [client]}},
         }
         try:
-            logger.info(f"→ yt-dlp cliente [{client}]...")
+            logger.info(f"→ yt-dlp [{client}] + node.js...")
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=True)
                 for f in os.listdir(tmp_dir):
                     fp = os.path.join(tmp_dir, f)
                     if os.path.isfile(fp) and os.path.getsize(fp) > 10_000:
-                        logger.info(f"✅ YouTube OK con cliente [{client}]")
+                        logger.info(f"✅ yt-dlp OK [{client}]")
                         return fp, info
         except Exception as e:
             err = str(e)
-            if "Sign in" in err or "sign in" in err:
-                logger.error(
-                    f"❌ [{client}] YouTube pide login — las cookies pueden estar "
-                    f"vencidas o mal formateadas en YOUTUBE_COOKIES"
-                )
-            elif "403" in err:
-                logger.warning(f"[{client}] 403 Forbidden — IP bloqueada para este cliente")
-            elif "Requested format" in err:
-                logger.warning(f"[{client}] Formato no disponible, probando siguiente cliente")
-            else:
-                logger.warning(f"[{client}] Error: {err[:120]}")
-
             if "DRM" in err:
+                return None, None  # Sin solución posible
+            if "Private video" in err or "private" in err.lower():
                 return None, None
-            continue
+            logger.warning(f"[{client}] {err[:120]}")
 
-    logger.error(f"❌ Todos los clientes fallaron para: {url}")
     return None, None
 
 
-# ─── Descargador genérico (non-YouTube) ───────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# ESTRATEGIA 3: yt-dlp legacy (android/ios/web + cookies opcionales)
+# ═══════════════════════════════════════════════════════════════════
+
+def _try_ytdlp_legacy(url: str, cookies: str | None) -> tuple[str | None, dict | None]:
+    """Fallback final con clientes que se benefician de cookies."""
+    import shutil
+    node_path = shutil.which("node") or shutil.which("nodejs")
+    js_runtimes = f"node:{node_path}" if node_path else "node"
+
+    base_opts = {
+        "quiet": True, "no_warnings": True, "merge_output_format": "mp4",
+        "noplaylist": True, "socket_timeout": 60, "nocheckcertificate": True,
+        "format": "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
+        "js_runtimes": js_runtimes,
+    }
+    if cookies:
+        base_opts["cookiefile"] = cookies
+
+    for client in ["ios", "android", "web"]:
+        tmp_dir = tempfile.mkdtemp()
+        opts = {
+            **base_opts,
+            "outtmpl": os.path.join(tmp_dir, "%(id)s.%(ext)s"),
+            "extractor_args": {"youtube": {"player_client": [client]}},
+        }
+        try:
+            logger.info(f"→ yt-dlp [{client}] legacy...")
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                for f in os.listdir(tmp_dir):
+                    fp = os.path.join(tmp_dir, f)
+                    if os.path.isfile(fp) and os.path.getsize(fp) > 10_000:
+                        logger.info(f"✅ yt-dlp legacy OK [{client}]")
+                        return fp, info
+        except Exception as e:
+            logger.warning(f"[{client}] legacy: {str(e)[:100]}")
+    return None, None
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Función principal YouTube
+# ═══════════════════════════════════════════════════════════════════
+
+def download_youtube(url: str, platform: str) -> tuple[str | None, dict | None]:
+    """
+    3 estrategias en cascada:
+      1. cobalt.tools API      — sin cookies, sin auth, gratis para siempre
+      2. yt-dlp tv_embedded    — sin cookies, funciona en cloud con Node.js
+      3. yt-dlp legacy         — fallback final, con cookies opcionales
+    """
+    cookies = _cookies(platform)
+
+    logger.info("🔄 [1/3] cobalt.tools...")
+    fp, info = _try_cobalt(url)
+    if fp:
+        return fp, info
+
+    logger.info("🔄 [2/3] yt-dlp tv_embedded + mweb...")
+    fp, info = _try_ytdlp_no_cookies(url, cookies)
+    if fp:
+        return fp, info
+
+    logger.info("🔄 [3/3] yt-dlp legacy...")
+    fp, info = _try_ytdlp_legacy(url, cookies)
+    if fp:
+        return fp, info
+
+    logger.error(f"❌ Todas las estrategias fallaron: {url}")
+    return None, None
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Descargador genérico (non-YouTube)
+# ═══════════════════════════════════════════════════════════════════
 
 def download_media(url: str, platform: str = None) -> tuple[str | None, dict | None]:
     if "threads.com" in url:
@@ -194,12 +341,17 @@ def download_media(url: str, platform: str = None) -> tuple[str | None, dict | N
     return None, None
 
 
-# ─── Reddit image fallback ────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# Reddit image fallback
+# ═══════════════════════════════════════════════════════════════════
 
 def download_reddit_image(url: str) -> tuple[str | None, dict | None]:
     try:
         clean = url.split("?")[0].rstrip("/")
-        headers = {"User-Agent": "mediabot/1.0"}
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/json",
+        }
         resp = requests.get(clean + ".json", headers=headers, timeout=15)
         resp.raise_for_status()
         post = resp.json()[0]["data"]["children"][0]["data"]
@@ -230,7 +382,9 @@ def download_reddit_image(url: str) -> tuple[str | None, dict | None]:
     return None, None
 
 
-# ─── Helpers ──────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# Helpers
+# ═══════════════════════════════════════════════════════════════════
 
 def clean_hashtags(text: str) -> str:
     if not text:
