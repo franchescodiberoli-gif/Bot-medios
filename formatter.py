@@ -99,13 +99,14 @@ def format_threads(info: dict, clean_url: str) -> str:
 
 
 def format_redgifs(info: dict, clean_url: str) -> str:
-    title    = info.get("title", "") or info.get("fulltitle", "") or ""
-    desc     = info.get("description", "") or ""
-    tags_raw = info.get("tags", [])
-    hashtags = " ".join(f"#{t}" for t in tags_raw) if tags_raw else clean_hashtags(desc)
+    title    = (info.get("title") or "").strip()
+    hashtags = " ".join(f"#{t}" for t in info.get("tags", [])) or clean_hashtags(info.get("description", ""))
+    uploader = info.get("uploader", "")
     msg = f"🎞️ *Redgifs*\n\n🔗 [Ver GIF]({clean_url})\n\n"
+    if uploader:
+        msg += f"👤 *@{uploader}*\n\n"
     if title:
-        msg += f"📌 *Título:* {title}\n\n"
+        msg += f"📝 *{title}*\n\n"
     if hashtags:
         msg += f"*#️⃣ Hashtags:*\n{hashtags}"
     return msg.strip()
@@ -114,14 +115,16 @@ def format_redgifs(info: dict, clean_url: str) -> str:
 def format_redgif_in_reddit(info: dict, redgif_url: str) -> str:
     reddit_title = info.get("reddit_title", info.get("title", ""))
     post_url     = info.get("reddit_post_url", info.get("webpage_url", ""))
-    desc         = info.get("description", "") or ""
     tags_raw     = info.get("tags", [])
-    hashtags     = " ".join(f"#{t}" for t in tags_raw) if tags_raw else clean_hashtags(desc)
+    hashtags     = " ".join(f"#{t}" for t in tags_raw) if tags_raw else clean_hashtags(info.get("description", ""))
+    uploader     = info.get("uploader", "")
     msg = f"👽 *Reddit*  ·  🎞️ GIF\n\n"
     if reddit_title:
         msg += f"📌 *Título:* {reddit_title}\n\n"
     msg += f"🔗 [Ver post]({post_url})\n"
     msg += f"🎬 [Ver en Redgifs]({redgif_url})\n"
+    if uploader:
+        msg += f"\n👤 *@{uploader}*\n"
     if hashtags:
         msg += f"\n*#️⃣ Hashtags:*\n{hashtags}"
     return msg.strip()
