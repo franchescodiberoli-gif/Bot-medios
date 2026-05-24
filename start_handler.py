@@ -13,7 +13,6 @@ Mándame un link y te descargo el contenido al instante.
 • ▶️ YouTube (Shorts y videos largos)
 • 👽 Reddit (video, gif, foto, redgif)
 • 🐦 Twitter / X
-• 🧵 Threads
 
 Solo pega el link y listo 🚀
 """
