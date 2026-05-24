@@ -28,6 +28,7 @@ PLATFORM_PATTERNS = {
     ],
     "reddit": [
         r"reddit\.com\/r\/.+\/comments\/",
+        r"reddit\.com\/user\/.+\/comments\/",
         r"redd\.it\/",
         r"v\.redd\.it\/",
         r"i\.redd\.it\/",
