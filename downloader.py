@@ -322,6 +322,140 @@ def download_redgifs(url: str) -> tuple[str | None, dict | None]:
 
 
 # ═══════════════════════════════════════════════════════════════════
+# Twitter / X  ──  descarga completa (video + imagen)
+# ═══════════════════════════════════════════════════════════════════
+
+def _fxtwitter_info(tweet_id: str) -> dict | None:
+    """Consulta fxtwitter/vxtwitter y devuelve el objeto tweet o None."""
+    hdrs = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
+        "Accept":     "application/json",
+    }
+    for fx_host in ("api.fxtwitter.com", "api.vxtwitter.com"):
+        try:
+            r = requests.get(
+                f"https://{fx_host}/status/{tweet_id}",
+                headers=hdrs, timeout=20, verify=False,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                tweet = data.get("tweet") or data.get("data") or {}
+                if tweet:
+                    logger.info(f"fxtwitter [{fx_host}] OK para {tweet_id}")
+                    return tweet
+            else:
+                logger.warning(f"fxtwitter [{fx_host}]: {r.status_code}")
+        except Exception as e:
+            logger.warning(f"fxtwitter [{fx_host}]: {e}")
+    return None
+
+
+def download_twitter(url: str) -> tuple[str | None, dict | None]:
+    """
+    Descarga video o imagen de un tweet.
+    Orden de intentos:
+      1. fxtwitter API → video directo
+      2. fxtwitter API → imagen
+      3. yt-dlp con cookies (fallback)
+      4. _download_twitter_image (último recurso)
+    """
+    m = re.search(r"status/(\d+)", url)
+    if not m:
+        return None, None
+    tweet_id = m.group(1)
+
+    base_info = {
+        "id":            tweet_id,
+        "title":         f"Tweet {tweet_id}",
+        "description":   "",
+        "webpage_url":   url,
+        "extractor_key": "Twitter",
+    }
+
+    # ── 1. fxtwitter: intentar video primero ──────────────────────
+    tweet = _fxtwitter_info(tweet_id)
+    if tweet:
+        text  = tweet.get("text", "")
+        media = tweet.get("media", {}) or {}
+
+        # Videos — fxtwitter devuelve lista en media.videos
+        videos = media.get("videos") or []
+        if not videos:
+            # Algunos endpoints mezclan todo en media.all
+            videos = [
+                item for item in (media.get("all") or [])
+                if item.get("type") in ("video", "gif")
+            ]
+
+        for vid in videos:
+            # fxtwitter da la URL directa del mp4 en .url
+            vid_url = vid.get("url") or vid.get("variants", [{}])[0].get("url", "")
+            if not vid_url:
+                continue
+            logger.info(f"fxtwitter video URL: {vid_url[:80]}")
+            fp = _download_direct_url(vid_url, "mp4")
+            if fp:
+                return fp, {
+                    **base_info,
+                    "title":       text[:100] or base_info["title"],
+                    "description": text,
+                    "ext":         "mp4",
+                }
+
+        # ── 2. fxtwitter: imagen ──────────────────────────────────
+        photos = media.get("photos") or [
+            i for i in (media.get("all") or [])
+            if i.get("type") in ("photo", "image")
+        ]
+        if photos:
+            img_url = photos[0].get("url", "")
+            if img_url:
+                all_images = [p.get("url", "") for p in photos if p.get("url")]
+                fp = _dl_image(img_url, "jpg")
+                if fp:
+                    return fp, {
+                        **base_info,
+                        "title":       text[:100] or base_info["title"],
+                        "description": text,
+                        "ext":         "jpg",
+                        "all_images":  all_images,
+                    }
+
+    # ── 3. yt-dlp con cookies ─────────────────────────────────────
+    logger.info("fxtwitter sin resultado, probando yt-dlp para Twitter...")
+    cookies = _cookies("twitter")
+    tmp_dir = tempfile.mkdtemp()
+    opts = {
+        "outtmpl":             os.path.join(tmp_dir, "%(id)s.%(ext)s"),
+        "quiet":               True,
+        "no_warnings":         True,
+        "merge_output_format": "mp4",
+        "noplaylist":          True,
+        "socket_timeout":      30,
+        "nocheckcertificate":  True,
+        "format":              "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+    }
+    if PROXY:
+        opts["proxy"] = PROXY
+    if cookies:
+        opts["cookiefile"] = cookies
+
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            for f in os.listdir(tmp_dir):
+                fp = os.path.join(tmp_dir, f)
+                if os.path.isfile(fp) and os.path.getsize(fp) > 10_000:
+                    return fp, info
+    except Exception as e:
+        logger.warning(f"download_twitter yt-dlp: {str(e)[:120]}")
+
+    # ── 4. Último recurso: imagen vía todos los métodos disponibles ──
+    logger.info("yt-dlp falló, intentando _download_twitter_image...")
+    return _download_twitter_image(url)
+
+
+# ═══════════════════════════════════════════════════════════════════
 # YouTube
 # ═══════════════════════════════════════════════════════════════════
 
@@ -344,6 +478,10 @@ def download_media(url: str, platform: str = None) -> tuple[str | None, dict | N
 
     if platform in ("youtube_short", "youtube_long"):
         return download_youtube(url, platform)
+
+    # Twitter/X: usa fxtwitter primero (evita bloqueos de API)
+    if platform == "twitter" or "x.com" in url or "twitter.com" in url:
+        return download_twitter(url)
 
     # Redgifs: usa API nativa con proxy, no yt-dlp
     if platform == "redgifs" or "redgifs.com" in url:
