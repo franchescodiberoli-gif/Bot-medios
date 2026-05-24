@@ -384,7 +384,6 @@ def download_media(url: str, platform: str = None) -> tuple[str | None, dict | N
 
 def _download_twitter_image(url: str) -> tuple[str | None, dict | None]:
     """Fallback para tweets que solo tienen imagen (sin video)."""
-    # Extraer tweet_id de la URL
     m = re.search(r"status/(\d+)", url)
     tweet_id = m.group(1) if m else "tweet"
 
@@ -395,8 +394,60 @@ def _download_twitter_image(url: str) -> tuple[str | None, dict | None]:
         "extractor_key": "Twitter",
     }
 
-    # ── Intento 1: yt-dlp con skip_download para obtener thumbnail ──
+    cookies = _cookies("twitter")
+
+    # ── Intento 1: yt-dlp con write_thumbnail ─────────────────────────
+    # yt-dlp puede escribir el thumbnail al disco aunque no haya video
     try:
+        tmp_dir = tempfile.mkdtemp()
+        opts = {
+            "quiet":              True,
+            "no_warnings":        True,
+            "skip_download":      True,
+            "writethumbnail":     True,
+            "outtmpl":            os.path.join(tmp_dir, "%(id)s.%(ext)s"),
+            "nocheckcertificate": True,
+        }
+        if PROXY:
+            opts["proxy"] = PROXY
+        if cookies:
+            opts["cookiefile"] = cookies
+
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            try:
+                info = ydl.extract_info(url, download=True)
+            except Exception:
+                info = None
+
+        # Buscar cualquier imagen descargada en tmp_dir
+        for fname in os.listdir(tmp_dir):
+            fpath = os.path.join(tmp_dir, fname)
+            ext = fname.rsplit(".", 1)[-1].lower()
+            if ext in ("jpg", "jpeg", "png", "webp") and os.path.getsize(fpath) > 1000:
+                result_info = info or base_info
+                result_info["ext"] = ext
+                return fpath, result_info
+
+    except Exception as e:
+        logger.warning(f"_download_twitter_image (writethumbnail): {e}")
+
+    # ── Intento 2: yt-dlp extract_info ignorando error No video ───────
+    # El error se lanza DESPUÉS de obtener el info, así que lo capturamos
+    try:
+        captured_info = {}
+
+        class _InfoCapture(yt_dlp.YoutubeDL):
+            def extract_info(self, url, download=True, **kw):
+                try:
+                    return super().extract_info(url, download=download, **kw)
+                except Exception as exc:
+                    if "No video" in str(exc) and self._last_info:
+                        return self._last_info
+                    raise
+            def process_ie_result(self, ie_result, download=True, extra_info=None):
+                captured_info.update(ie_result)
+                return super().process_ie_result(ie_result, download=download, extra_info=extra_info)
+
         opts = {
             "quiet":              True,
             "no_warnings":        True,
@@ -405,39 +456,48 @@ def _download_twitter_image(url: str) -> tuple[str | None, dict | None]:
         }
         if PROXY:
             opts["proxy"] = PROXY
-        cookies = _cookies("twitter")
         if cookies:
             opts["cookiefile"] = cookies
 
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+        try:
+            with _InfoCapture(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+        except Exception:
+            info = captured_info if captured_info else None
 
-        # Buscar imágenes en entries (tweet con múltiples fotos)
-        entries = info.get("entries") or []
-        if not entries and info.get("thumbnail"):
-            entries = [info]
+        if info:
+            thumbnails = info.get("thumbnails") or []
+            thumbnail  = info.get("thumbnail", "")
+            # Buscar la imagen más grande en thumbnails
+            best_url = ""
+            best_w   = 0
+            for t in thumbnails:
+                w = t.get("width", 0) or 0
+                u = t.get("url", "")
+                if u and w >= best_w:
+                    best_w   = w
+                    best_url = u
+            if not best_url:
+                best_url = thumbnail
 
-        for entry in entries or [info]:
-            thumbnail = entry.get("thumbnail") or ""
-            if not thumbnail:
-                continue
-            ext = thumbnail.split(".")[-1].split("?")[0].lower()
-            if ext not in ("jpg", "jpeg", "png", "webp"):
-                ext = "jpg"
-            img_url = thumbnail
-            if "pbs.twimg.com" in thumbnail:
-                img_url = re.sub(r"\?.*$", "", thumbnail) + "?format=jpg&name=large"
-            fp = _dl_image(img_url, ext)
-            if fp:
-                info["ext"] = ext
-                return fp, info
+            if best_url:
+                img_url = best_url
+                if "pbs.twimg.com" in best_url:
+                    img_url = re.sub(r"\?.*$", "", best_url) + "?format=jpg&name=large"
+                fp = _dl_image(img_url, "jpg")
+                if fp:
+                    info["ext"] = "jpg"
+                    return fp, info
 
     except Exception as e:
-        logger.warning(f"_download_twitter_image (yt-dlp): {e}")
+        logger.warning(f"_download_twitter_image (extract_info): {e}")
 
-    # ── Intento 2: API pública de Twitter/X syndication ──────────────
+    # ── Intento 3: API de syndication via proxy ────────────────────────
     try:
-        api_url = f"https://cdn.syndication.twimg.com/tweet-result?id={tweet_id}&lang=en&features=tfw_timeline_list%3A%3Btfw_follower_count_sunset%3Atrue&token=x"
+        api_url = (
+            f"https://cdn.syndication.twimg.com/tweet-result"
+            f"?id={tweet_id}&lang=en&token=x"
+        )
         hdrs = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
             "Accept":     "application/json",
@@ -447,38 +507,22 @@ def _download_twitter_image(url: str) -> tuple[str | None, dict | None]:
         r = requests.get(api_url, headers=hdrs, timeout=20,
                          proxies=PROXIES, verify=False)
         if r.status_code == 200:
-            data = r.json()
-            # Buscar mediaDetails con fotos
+            data       = r.json()
             media_list = data.get("mediaDetails") or []
-            photos = [m for m in media_list if m.get("type") == "photo"]
-            if photos:
-                # Tomar la de mayor resolución
-                best = photos[0]
-                sizes = best.get("sizes", {})
-                # Preferir "large" > "medium" > "small"
-                size_key = next((k for k in ("large", "medium", "small") if k in sizes), None)
-                base_media_url = best.get("media_url_https", "")
+            photos     = [md for md in media_list if md.get("type") == "photo"]
+            targets    = photos if photos else media_list
+            for item in targets:
+                base_media_url = item.get("media_url_https", "")
                 if base_media_url:
-                    img_url = base_media_url + (f"?name={size_key}" if size_key else "?name=large")
-                    ext = base_media_url.rsplit(".", 1)[-1].split("?")[0].lower()
-                    if ext not in ("jpg", "jpeg", "png", "webp"):
-                        ext = "jpg"
-                    fp = _dl_image(img_url, ext)
+                    img_url = base_media_url + "?name=large"
+                    fp = _dl_image(img_url, "jpg")
                     if fp:
                         text = data.get("text", "")
-                        info = {**base_info, "title": text[:100] if text else base_info["title"], "ext": ext}
-                        return fp, info
-
-            # Sin fotos pero hay video thumbnail
-            for m_item in media_list:
-                thumb = m_item.get("media_url_https", "")
-                if thumb:
-                    fp = _dl_image(thumb + "?name=large", "jpg")
-                    if fp:
-                        return fp, {**base_info, "ext": "jpg"}
-
+                        return fp, {**base_info, "title": text[:100] or base_info["title"], "ext": "jpg"}
+        else:
+            logger.warning(f"_download_twitter_image syndication: {r.status_code}")
     except Exception as e:
-        logger.warning(f"_download_twitter_image (syndication API): {e}")
+        logger.warning(f"_download_twitter_image (syndication): {e}")
 
     logger.warning(f"_download_twitter_image: no se pudo obtener imagen del tweet {tweet_id}")
     return None, None
