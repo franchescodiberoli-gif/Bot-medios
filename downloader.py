@@ -192,6 +192,103 @@ def _try_ytdlp_all(url: str, cookies: str | None) -> tuple[str | None, dict | No
 
 
 # ═══════════════════════════════════════════════════════════════════
+# Redgifs  ──  descarga nativa vía API (sin yt-dlp)
+# ═══════════════════════════════════════════════════════════════════
+
+def _redgifs_get_token(session: requests.Session) -> str | None:
+    headers = {
+        "User-Agent":     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
+        "Origin":         "https://www.redgifs.com",
+        "Referer":        "https://www.redgifs.com/",
+        "Accept":         "application/json",
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-site",
+    }
+    try:
+        r = session.get("https://api.redgifs.com/v2/auth/temporary",
+                        headers=headers, timeout=20, proxies=PROXIES, verify=False)
+        if r.status_code == 200:
+            return r.json().get("token")
+        logger.warning(f"redgifs auth: {r.status_code} {r.text[:100]}")
+    except Exception as e:
+        logger.warning(f"redgifs auth error: {e}")
+    return None
+
+
+def download_redgifs(url: str) -> tuple[str | None, dict | None]:
+    """Descarga un video de redgifs.com/watch/<id> via API con proxy."""
+    m = re.search(r"redgifs\.com/(?:watch|ifr)/([a-zA-Z0-9]+)", url)
+    if not m:
+        return None, None
+
+    gif_id  = m.group(1).lower()
+    session = requests.Session()
+
+    # Cargar cookies de redgifs si existen
+    for line in (REDGIFS_COOKIES or "").strip().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) >= 7:
+            session.cookies.set(parts[5], parts[6], domain=parts[0].lstrip("."))
+
+    token = _redgifs_get_token(session)
+
+    api_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
+        "Origin":     "https://www.redgifs.com",
+        "Referer":    f"https://www.redgifs.com/watch/{gif_id}",
+        "Accept":     "application/json",
+    }
+    if token:
+        api_headers["Authorization"] = f"Bearer {token}"
+
+    try:
+        r = session.get(f"https://api.redgifs.com/v2/gifs/{gif_id}",
+                        headers=api_headers, timeout=20,
+                        proxies=PROXIES, verify=False)
+        r.raise_for_status()
+        gif   = r.json().get("gif", {})
+        urls  = gif.get("urls", {})
+        title = gif.get("title") or gif_id
+        tags  = gif.get("tags", [])
+
+        video_url = urls.get("hd") or urls.get("sd") or urls.get("gif")
+        if not video_url:
+            logger.warning(f"redgifs: sin URL de video para {gif_id}")
+            return None, None
+
+        ext = "mp4" if ".mp4" in video_url else "gif"
+        dl_headers = {**api_headers, "Accept": "*/*"}
+        tmp = os.path.join(tempfile.mkdtemp(), f"redgifs.{ext}")
+        with session.get(video_url, headers=dl_headers, stream=True,
+                         timeout=120, proxies=PROXIES, verify=False) as rv:
+            rv.raise_for_status()
+            with open(tmp, "wb") as f:
+                for chunk in rv.iter_content(chunk_size=256 * 1024):
+                    f.write(chunk)
+
+        if os.path.getsize(tmp) > 10_000:
+            info = {
+                "id":            gif_id,
+                "title":         title,
+                "tags":          tags,
+                "description":   " ".join(f"#{t}" for t in tags),
+                "webpage_url":   f"https://www.redgifs.com/watch/{gif_id}",
+                "extractor_key": "RedGifs",
+                "ext":           ext,
+            }
+            return tmp, info
+
+    except Exception as e:
+        logger.error(f"download_redgifs error: {e}")
+
+    return None, None
+
+
+# ═══════════════════════════════════════════════════════════════════
 # YouTube
 # ═══════════════════════════════════════════════════════════════════
 
@@ -213,6 +310,10 @@ def download_media(url: str, platform: str = None) -> tuple[str | None, dict | N
 
     if platform in ("youtube_short", "youtube_long"):
         return download_youtube(url, platform)
+
+    # Redgifs: usa API nativa con proxy, no yt-dlp
+    if platform == "redgifs" or "redgifs.com" in url:
+        return download_redgifs(url)
 
     tmp_dir = tempfile.mkdtemp()
     opts = {
