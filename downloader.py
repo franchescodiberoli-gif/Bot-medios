@@ -15,7 +15,6 @@ REDDIT_COOKIES    = os.environ.get("REDDIT_COOKIES",    None)
 REDGIFS_COOKIES   = os.environ.get("REDGIFS_COOKIES",   None)
 COOKIES_FILE      = os.environ.get("COOKIES_FILE",      None)
 
-# ── Proxy desde Secrets (no hardcodeado) ──────────────────────────
 PROXY   = os.environ.get("PROXY_URL", "")
 PROXIES = {"http": PROXY, "https": PROXY} if PROXY else {}
 
@@ -74,7 +73,7 @@ def _extract_video_id(url: str) -> str | None:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# ESTRATEGIA 1: cobalt.tools
+# COBALT
 # ═══════════════════════════════════════════════════════════════════
 
 COBALT_INSTANCES = [
@@ -146,7 +145,7 @@ def _try_cobalt(url: str) -> tuple[str | None, dict | None]:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# ESTRATEGIA 2: yt-dlp con proxy
+# yt-dlp
 # ═══════════════════════════════════════════════════════════════════
 
 def _ytdlp_download(url: str, client: str, cookies: str | None) -> tuple[str | None, dict | None]:
@@ -193,7 +192,7 @@ def _try_ytdlp_all(url: str, cookies: str | None) -> tuple[str | None, dict | No
 
 
 # ═══════════════════════════════════════════════════════════════════
-# YouTube principal
+# YouTube
 # ═══════════════════════════════════════════════════════════════════
 
 def download_youtube(url: str, platform: str) -> tuple[str | None, dict | None]:
@@ -245,41 +244,177 @@ def download_media(url: str, platform: str = None) -> tuple[str | None, dict | N
 
 
 # ═══════════════════════════════════════════════════════════════════
-# Reddit imagen fallback
+# Reddit  ──  descarga completa
+#   Retorna (archivos, info)
+#   archivos puede ser: str (1 archivo) o list[str] (galería)
 # ═══════════════════════════════════════════════════════════════════
 
-def download_reddit_image(url: str) -> tuple[str | None, dict | None]:
+_IMG_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".gifv"}
+_HEADERS  = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0",
+    "Accept":     "application/json",
+}
+
+
+def _fetch_post_json(url: str) -> dict | None:
+    """Obtiene el dict de datos del primer post de la URL de Reddit."""
+    clean = re.split(r"[?#]", url)[0].rstrip("/")
     try:
-        clean   = url.split("?")[0].rstrip("/")
-        headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
-        resp    = requests.get(clean + ".json", headers=headers, proxies=PROXIES, timeout=15)
+        resp = requests.get(clean + ".json", headers=_HEADERS,
+                            proxies=PROXIES, timeout=20, verify=False)
         resp.raise_for_status()
-        post    = resp.json()[0]["data"]["children"][0]["data"]
-        title   = post.get("title", "Reddit post")
-        img_url = post.get("url_overridden_by_dest", "")
-
-        if img_url and any(img_url.lower().endswith(e) for e in [".jpg",".jpeg",".png",".gif",".webp"]):
-            ext = img_url.split(".")[-1].split("?")[0].lower()
-            r   = requests.get(img_url, headers=headers, proxies=PROXIES, timeout=30)
-            r.raise_for_status()
-            tmp = os.path.join(tempfile.mkdtemp(), f"reddit.{ext}")
-            with open(tmp, "wb") as f:
-                f.write(r.content)
-            return tmp, {"title": title, "webpage_url": url, "ext": ext, "extractor_key": "Reddit"}
-
-        if post.get("is_gallery") and post.get("media_metadata"):
-            for _, media in post["media_metadata"].items():
-                if media.get("status") == "valid":
-                    img_url = media.get("s", {}).get("u", "").replace("&amp;", "&")
-                    if img_url:
-                        r = requests.get(img_url, headers=headers, proxies=PROXIES, timeout=30)
-                        tmp = os.path.join(tempfile.mkdtemp(), "reddit.jpg")
-                        with open(tmp, "wb") as f:
-                            f.write(r.content)
-                        return tmp, {"title": title, "webpage_url": url, "ext": "jpg", "extractor_key": "Reddit"}
+        data = resp.json()
+        return data[0]["data"]["children"][0]["data"]
     except Exception as e:
-        logger.error(f"download_reddit_image error: {e}")
+        logger.error(f"_fetch_post_json error: {e}")
+    return None
+
+
+def _dl_image(img_url: str, ext: str = "jpg") -> str | None:
+    """Descarga una imagen/gif a un archivo temporal."""
+    try:
+        r = requests.get(img_url, headers=_HEADERS, proxies=PROXIES,
+                         timeout=30, verify=False)
+        r.raise_for_status()
+        tmp = os.path.join(tempfile.mkdtemp(), f"reddit.{ext}")
+        with open(tmp, "wb") as f:
+            f.write(r.content)
+        if os.path.getsize(tmp) > 1000:
+            return tmp
+    except Exception as e:
+        logger.warning(f"_dl_image: {e}")
+    return None
+
+
+def download_reddit_post(url: str) -> tuple[str | list[str] | None, dict | None]:
+    """
+    Descarga un post de Reddit. Devuelve:
+      - (str, info)       → imagen única / video / gif
+      - (list[str], info) → galería de imágenes
+      - (None, None)      → error
+    """
+    post = _fetch_post_json(url)
+    if not post:
+        return None, None
+
+    title   = post.get("title", "Reddit post")
+    post_url = post.get("url_overridden_by_dest", "")
+    base_info = {"title": title, "webpage_url": url, "extractor_key": "Reddit"}
+
+    # ── 1. Galería ────────────────────────────────────────────────
+    if post.get("is_gallery") and post.get("media_metadata"):
+        files = []
+        # gallery_data tiene el orden correcto
+        ordered_ids = []
+        gd = post.get("gallery_data", {})
+        if gd and gd.get("items"):
+            ordered_ids = [item["media_id"] for item in gd["items"]]
+        else:
+            ordered_ids = list(post["media_metadata"].keys())
+
+        for mid in ordered_ids:
+            media = post["media_metadata"].get(mid, {})
+            if media.get("status") != "valid":
+                continue
+            mime = media.get("m", "image/jpeg")
+            ext  = mime.split("/")[-1] if "/" in mime else "jpg"
+            # URL de máxima resolución
+            img_url = (media.get("s", {}).get("u", "") or "").replace("&amp;", "&")
+            if not img_url:
+                continue
+            fp = _dl_image(img_url, ext)
+            if fp:
+                files.append(fp)
+
+        if files:
+            info = {**base_info, "ext": "jpg", "count": len(files), "type": "gallery"}
+            return files, info
+
+    # ── 2. Imagen única (jpg/png/gif/webp directo) ─────────────────
+    if post_url:
+        url_low = post_url.lower().split("?")[0]
+        ext = url_low.rsplit(".", 1)[-1] if "." in url_low else ""
+        if ext in ("jpg", "jpeg", "png", "webp", "gif", "gifv"):
+            actual_url = post_url
+            # gifv → mp4 en imgur
+            if ext == "gifv":
+                actual_url = post_url.replace(".gifv", ".mp4")
+                fp = _dl_image(actual_url, "mp4")
+                if fp:
+                    return fp, {**base_info, "ext": "mp4", "type": "video"}
+            fp = _dl_image(actual_url, ext)
+            if fp:
+                tipo = "gif" if ext == "gif" else "image"
+                return fp, {**base_info, "ext": ext, "type": tipo}
+
+    # ── 3. Redgifs embebido en post de Reddit ─────────────────────
+    media = post.get("media") or {}
+    oembed = media.get("oembed", {})
+    secure_media = post.get("secure_media") or {}
+    redgif_url = None
+
+    # Buscar URL de redgifs en distintos campos
+    for field in [post.get("url_overridden_by_dest", ""),
+                  media.get("reddit_video", {}).get("fallback_url", ""),
+                  secure_media.get("reddit_video", {}).get("fallback_url", "")]:
+        if "redgifs.com" in str(field):
+            redgif_url = field
+            break
+
+    if not redgif_url:
+        # También en media.type
+        mt = media.get("type", "")
+        if "redgifs" in mt:
+            # extraer del embed html
+            embed_html = oembed.get("html", "")
+            m = re.search(r'redgifs\.com/ifr/([a-zA-Z0-9]+)', embed_html)
+            if m:
+                redgif_url = f"https://www.redgifs.com/watch/{m.group(1)}"
+
+    if redgif_url:
+        logger.info(f"Reddit post contiene redgifs: {redgif_url}")
+        fp, rg_info = download_media(redgif_url, "redgifs")
+        if fp and rg_info:
+            # Enriquecer con info del post de Reddit
+            rg_info["reddit_title"]   = title
+            rg_info["reddit_post_url"] = url
+            rg_info["redgif_url"]     = redgif_url
+            rg_info["type"]           = "redgif_in_reddit"
+            return fp, rg_info
+
+    # ── 4. Video nativo de Reddit (v.redd.it) ─────────────────────
+    rv = (post.get("media") or {}).get("reddit_video") or \
+         (post.get("secure_media") or {}).get("reddit_video")
+    if rv:
+        video_url = rv.get("fallback_url", "").replace("?source=fallback", "")
+        if video_url:
+            fp, info = download_media(video_url, "reddit")
+            if fp:
+                if info:
+                    info["title"] = title
+                    info["webpage_url"] = url
+                else:
+                    info = {**base_info, "ext": "mp4", "type": "video"}
+                return fp, info
+
+    # ── 5. Intentar con yt-dlp directamente ───────────────────────
+    fp, info = download_media(url, "reddit")
+    if fp:
+        if info:
+            info.setdefault("title", title)
+        return fp, info
+
     return None, None
+
+
+# ── Alias para compatibilidad ────────────────────────────────────────
+def download_reddit_image(url: str) -> tuple[str | None, dict | None]:
+    """Wrapper de compatibilidad — usa download_reddit_post internamente."""
+    result, info = download_reddit_post(url)
+    if isinstance(result, list):
+        # Devuelve primera imagen para compatibilidad con código viejo
+        return result[0] if result else None, info
+    return result, info
 
 
 # ═══════════════════════════════════════════════════════════════════
