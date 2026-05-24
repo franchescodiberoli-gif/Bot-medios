@@ -13,6 +13,7 @@ INSTAGRAM_COOKIES = os.environ.get("INSTAGRAM_COOKIES", None)
 YOUTUBE_COOKIES   = os.environ.get("YOUTUBE_COOKIES",   None)
 REDDIT_COOKIES    = os.environ.get("REDDIT_COOKIES",    None)
 REDGIFS_COOKIES   = os.environ.get("REDGIFS_COOKIES",   None)
+TWITTER_COOKIES   = os.environ.get("TWITTER_COOKIES",   None)
 COOKIES_FILE      = os.environ.get("COOKIES_FILE",      None)
 
 PROXY   = os.environ.get("PROXY_URL", "")
@@ -23,6 +24,7 @@ _PATHS = {
     "youtube":   "/tmp/yt_cookies.txt",
     "reddit":    "/tmp/rd_cookies.txt",
     "redgifs":   "/tmp/rg_cookies.txt",
+    "twitter":   "/tmp/tw_cookies.txt",
 }
 
 
@@ -50,6 +52,7 @@ def _cookies(platform: str) -> str | None:
         "youtube_long":  (YOUTUBE_COOKIES,   "youtube"),
         "reddit":        (REDDIT_COOKIES,    "reddit"),
         "redgifs":       (REDGIFS_COOKIES,   "redgifs"),
+        "twitter":       (TWITTER_COOKIES,   "twitter"),
     }
     if platform in mapping:
         content, key = mapping[platform]
@@ -308,8 +311,9 @@ def download_youtube(url: str, platform: str) -> tuple[str | None, dict | None]:
 # ═══════════════════════════════════════════════════════════════════
 
 def download_media(url: str, platform: str = None) -> tuple[str | None, dict | None]:
-    if "threads.com" in url:
-        url = url.replace("threads.com", "threads.net")
+    # Threads: forzar threads.net en todos los casos
+    if "threads.com" in url or "threads.net" in url:
+        url = re.sub(r"https?://(www\.)?threads\.(com|net)", "https://www.threads.net", url)
 
     if platform in ("youtube_short", "youtube_long"):
         return download_youtube(url, platform)
@@ -343,7 +347,49 @@ def download_media(url: str, platform: str = None) -> tuple[str | None, dict | N
                 if os.path.isfile(fp):
                     return fp, info
     except Exception as e:
+        err = str(e)
+        # Twitter: si no hay video intentar descargar imagen del tweet
+        if platform == "twitter" and "No video" in err:
+            return _download_twitter_image(url)
         logger.error(f"download_media error: {e}")
+    return None, None
+
+
+def _download_twitter_image(url: str) -> tuple[str | None, dict | None]:
+    """Fallback para tweets que solo tienen imagen (sin video)."""
+    try:
+        # yt-dlp puede extraer info aunque no haya video
+        opts = {
+            "quiet":              True,
+            "no_warnings":        True,
+            "skip_download":      True,
+            "nocheckcertificate": True,
+        }
+        if PROXY:
+            opts["proxy"] = PROXY
+        cookies = _cookies("twitter")
+        if cookies:
+            opts["cookiefile"] = cookies
+
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+
+        # Buscar thumbnail o imagen en el info
+        thumbnail = info.get("thumbnail") or ""
+        if thumbnail:
+            ext = thumbnail.split(".")[-1].split("?")[0].lower()
+            if ext not in ("jpg", "jpeg", "png", "webp"):
+                ext = "jpg"
+            # Añadir ?format=jpg&name=large para máxima calidad en pbs.twimg.com
+            img_url = thumbnail
+            if "pbs.twimg.com" in thumbnail:
+                img_url = re.sub(r"\?.*$", "", thumbnail) + "?format=jpg&name=large"
+            fp = _dl_image(img_url, ext)
+            if fp:
+                info["ext"] = ext
+                return fp, info
+    except Exception as e:
+        logger.warning(f"_download_twitter_image: {e}")
     return None, None
 
 
