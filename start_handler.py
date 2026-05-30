@@ -10,11 +10,15 @@ Mándame un link y te descargo el contenido al instante.
 • 📸 Instagram (video, foto, reels)
 • 🎵 TikTok
 • 📘 Facebook
+• 📢 Facebook Ads Library (videos de anuncios)
 • ▶️ YouTube (Shorts y videos largos)
 • 👽 Reddit (video, gif, foto, redgif)
 • 🐦 Twitter / X
 
 Solo pega el link y listo 🚀
+
+💡 *Para anuncios de Facebook:*
+Pega el link completo de ads/library con el `?id=` incluido.
 """
 
 HELP_MSG = """
