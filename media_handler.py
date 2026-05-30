@@ -7,7 +7,7 @@ from telegram.ext import ContextTypes
 from telegram.constants import ChatAction
 from telegram.error import BadRequest
 from url_detector import extract_url, detect_platform
-from downloader import download_media, download_reddit_post, get_clean_url
+from downloader import download_media, download_reddit_post, download_facebook_ads, get_clean_url
 from formatter import format_message
 
 logger = logging.getLogger(__name__)
@@ -38,7 +38,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if platform == "unknown":
         await update.message.reply_text(
             "❓ No reconozco esa red social. Las que soporto son:\n"
-            "📸 Instagram · 🎵 TikTok · 📘 Facebook · ▶️ YouTube · 👽 Reddit · 🐦 Twitter · 🧵 Threads"
+            "📸 Instagram · 🎵 TikTok · 📘 Facebook · 📢 Facebook Ads · ▶️ YouTube · 👽 Reddit · 🐦 Twitter"
         )
         return
 
@@ -48,6 +48,12 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         processing_msg = await update.message.reply_text(
             "⏳ Descargando video de YouTube...\n"
             "_(Puede tardar unos segundos, probando múltiples métodos)_",
+            parse_mode="Markdown",
+        )
+    elif platform == "facebook_ads":
+        processing_msg = await update.message.reply_text(
+            "⏳ Descargando video del anuncio de Facebook Ads Library...\n"
+            "_(Probando múltiples métodos)_",
             parse_mode="Markdown",
         )
     else:
@@ -62,6 +68,11 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # ── Redgifs: flujo especial ────────────────────────────────
         if platform == "redgifs":
             await _handle_redgifs(update, processing_msg, url)
+            return
+
+        # ── Facebook Ads Library: flujo especial ──────────────────
+        if platform == "facebook_ads":
+            await _handle_facebook_ads(update, processing_msg, url)
             return
 
         # ── Resto de plataformas ───────────────────────────────────
@@ -210,6 +221,43 @@ async def _handle_redgifs(update, processing_msg, url: str):
     ext          = os.path.splitext(file_path)[1].lower()
     file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
     await _send_single_file(update, file_path, ext, file_size_mb, caption_text)
+    _cleanup(file_path)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Facebook Ads Library handler
+# ═══════════════════════════════════════════════════════════════════
+
+async def _handle_facebook_ads(update, processing_msg, url: str):
+    file_path, info = download_facebook_ads(url)
+
+    if not file_path or not info:
+        await processing_msg.edit_text(
+            "❌ No pude descargar ese anuncio de Facebook Ads Library.\n\n"
+            "Posibles causas:\n"
+            "• El anuncio no tiene video (solo imagen)\n"
+            "• El ID del anuncio no existe o fue eliminado\n"
+            "• Facebook está bloqueando la descarga\n\n"
+            "Asegúrate de enviar el link completo con el `?id=XXXXXXXXXX`"
+        )
+        return
+
+    await processing_msg.delete()
+
+    ad_id     = info.get("id", "")
+    clean_url = f"https://www.facebook.com/ads/library/?id={ad_id}"
+    caption_text = format_message("facebook_ads", info, clean_url)
+    ext          = os.path.splitext(file_path)[1].lower()
+    file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+
+    width = height = duration = 0
+    if ext not in IMAGE_EXTS and ext != ".gif":
+        width, height, duration = _video_metadata(file_path, info)
+
+    await _send_single_file(
+        update, file_path, ext, file_size_mb, caption_text,
+        width=width, height=height, duration=duration,
+    )
     _cleanup(file_path)
 
 
