@@ -490,14 +490,26 @@ def _fb_session() -> tuple[requests.Session, str | None]:
     """
     session = requests.Session()
     cookies_path = _cookies("facebook_ads")  # escribe el archivo Netscape y devuelve la ruta
+    loaded = False
     if cookies_path and os.path.exists(cookies_path):
         try:
             cj = http.cookiejar.MozillaCookieJar()
             cj.load(cookies_path, ignore_discard=True, ignore_expires=True)
             session.cookies = cj
+            loaded = len(cj) > 0
             logger.info(f"fb_ads: cookies cargadas ({len(cj)} entradas)")
         except Exception as e:
             logger.warning(f"fb_ads: no se pudieron cargar cookies: {e}")
+
+    if not loaded:
+        # Sin cookies de login: al menos intentamos sembrar la cookie `datr`
+        # visitando la home, lo que a veces reduce los 403 a peticiones nuevas.
+        logger.info("fb_ads: sin cookies de login, bootstrapping datr desde la home...")
+        try:
+            session.get("https://www.facebook.com/", headers=_fb_headers(),
+                        timeout=20, proxies=PROXIES, verify=False)
+        except Exception as e:
+            logger.warning(f"fb_ads bootstrap: {e}")
     return session, cookies_path
 
 
