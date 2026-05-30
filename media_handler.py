@@ -229,15 +229,17 @@ async def _handle_redgifs(update, processing_msg, url: str):
 # ═══════════════════════════════════════════════════════════════════
 
 async def _handle_facebook_ads(update, processing_msg, url: str):
-    file_path, info = download_facebook_ads(url)
+    files, info = download_facebook_ads(url)
 
-    if not file_path or not info:
+    if not files or not info:
         await processing_msg.edit_text(
             "❌ No pude descargar ese anuncio de Facebook Ads Library.\n\n"
             "Posibles causas:\n"
-            "• El anuncio no tiene video (solo imagen)\n"
+            "• Facebook está bloqueando la descarga (error 403)\n"
             "• El ID del anuncio no existe o fue eliminado\n"
-            "• Facebook está bloqueando la descarga\n\n"
+            "• El anuncio no tiene media descargable\n\n"
+            "💡 Si ves error 403 en los logs, configura `FACEBOOK_COOKIES` "
+            "con las cookies de una sesión iniciada de Facebook.\n"
             "Asegúrate de enviar el link completo con el `?id=XXXXXXXXXX`"
         )
         return
@@ -247,18 +249,45 @@ async def _handle_facebook_ads(update, processing_msg, url: str):
     ad_id     = info.get("id", "")
     clean_url = f"https://www.facebook.com/ads/library/?id={ad_id}"
     caption_text = format_message("facebook_ads", info, clean_url)
-    ext          = os.path.splitext(file_path)[1].lower()
-    file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+
+    # ── Carrusel de imágenes (varias fotos) ───────────────────────────
+    if isinstance(files, list) and len(files) > 1:
+        media_caption, overflow = _split_caption(caption_text)
+        media_group = []
+        for i, fp in enumerate(files[:10]):
+            cap = media_caption if i == 0 else None
+            with open(fp, "rb") as f:
+                data = f.read()
+            media_group.append(
+                InputMediaPhoto(media=data, caption=cap, parse_mode="Markdown")
+            )
+        try:
+            await update.message.reply_media_group(media=media_group)
+        except BadRequest:
+            # Reintento sin Markdown si el caption tiene entidades inválidas
+            plain = [InputMediaPhoto(media=open(fp, "rb").read(),
+                                     caption=(caption_text if i == 0 else None))
+                     for i, fp in enumerate(files[:10])]
+            await update.message.reply_media_group(media=plain)
+        if overflow:
+            await _send_long_text(update, overflow)
+        _cleanup(files)
+        return
+
+    # ── Archivo único (1 video o 1 imagen) ────────────────────────────
+    fp = files[0] if isinstance(files, list) else files
+    ext          = os.path.splitext(fp)[1].lower()
+    file_size_mb = os.path.getsize(fp) / (1024 * 1024)
 
     width = height = duration = 0
     if ext not in IMAGE_EXTS and ext != ".gif":
-        width, height, duration = _video_metadata(file_path, info)
+        width, height, duration = _video_metadata(fp, info)
 
     await _send_single_file(
-        update, file_path, ext, file_size_mb, caption_text,
+        update, fp, ext, file_size_mb, caption_text,
         width=width, height=height, duration=duration,
     )
-    _cleanup(file_path)
+    _cleanup(fp)
 
 
 # ═══════════════════════════════════════════════════════════════════
