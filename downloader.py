@@ -482,35 +482,72 @@ def _extract_fb_ad_id(url: str) -> str | None:
     return m.group(1) if m else None
 
 
-def _fb_session() -> tuple[requests.Session, str | None]:
-    """
-    Crea una sesión de requests con las cookies de Facebook cargadas (si existen).
-    Las cookies de una sesión iniciada son lo que normalmente evita el 403 que
-    Facebook devuelve a peticiones automatizadas desde IPs de datacenter.
-    """
-    session = requests.Session()
-    cookies_path = _cookies("facebook_ads")  # escribe el archivo Netscape y devuelve la ruta
-    loaded = False
-    if cookies_path and os.path.exists(cookies_path):
+# curl_cffi imita la huella TLS de un navegador real (Chrome). Facebook bloquea
+# (403) las peticiones de `requests` por su huella de cliente, así que cuando esté
+# disponible la usamos para el scraping; si no, caemos a requests normal.
+try:
+    from curl_cffi import requests as cffi_requests
+    _HAS_CFFI = True
+except Exception:
+    _HAS_CFFI = False
+
+FB_IMPERSONATE = os.environ.get("FB_IMPERSONATE", "chrome124")
+
+
+def _fb_cookie_dict() -> dict:
+    """Lee el archivo de cookies de Facebook (Netscape) a un dict {nombre: valor}."""
+    path = _cookies("facebook_ads")
+    cookies = {}
+    if path and os.path.exists(path):
         try:
             cj = http.cookiejar.MozillaCookieJar()
-            cj.load(cookies_path, ignore_discard=True, ignore_expires=True)
-            session.cookies = cj
-            loaded = len(cj) > 0
-            logger.info(f"fb_ads: cookies cargadas ({len(cj)} entradas)")
+            cj.load(path, ignore_discard=True, ignore_expires=True)
+            for c in cj:
+                cookies[c.name] = c.value
         except Exception as e:
-            logger.warning(f"fb_ads: no se pudieron cargar cookies: {e}")
+            logger.warning(f"_fb_cookie_dict: {e}")
+    return cookies
 
-    if not loaded:
-        # Sin cookies de login: al menos intentamos sembrar la cookie `datr`
-        # visitando la home, lo que a veces reduce los 403 a peticiones nuevas.
-        logger.info("fb_ads: sin cookies de login, bootstrapping datr desde la home...")
-        try:
-            session.get("https://www.facebook.com/", headers=_fb_headers(),
-                        timeout=20, proxies=PROXIES, verify=False)
-        except Exception as e:
-            logger.warning(f"fb_ads bootstrap: {e}")
-    return session, cookies_path
+
+def _fb_get(url: str, cookies: dict, headers: dict, timeout: int = 30):
+    """
+    GET a Facebook imitando un navegador real con curl_cffi (si está disponible).
+    Devuelve un objeto respuesta con .status_code, .text y .content.
+    """
+    if _HAS_CFFI:
+        kw = {
+            "headers":     headers,
+            "timeout":     timeout,
+            "impersonate": FB_IMPERSONATE,
+            "verify":      False,
+        }
+        if cookies:
+            kw["cookies"] = cookies
+        if PROXY:
+            kw["proxies"] = {"http": PROXY, "https": PROXY}
+        return cffi_requests.get(url, **kw)
+    # Fallback: requests normal (más propenso al 403)
+    sess = requests.Session()
+    if cookies:
+        sess.cookies.update(cookies)
+    return sess.get(url, headers=headers, timeout=timeout,
+                    proxies=PROXIES, verify=False)
+
+
+def _fb_session() -> tuple[dict, str | None]:
+    """
+    Carga las cookies de Facebook y devuelve (cookie_dict, ruta).
+    El cookie_dict se usa con _fb_get (curl_cffi). Las cookies de una sesión
+    iniciada + huella de navegador real son lo que normalmente evita el 403.
+    """
+    cookies_path = _cookies("facebook_ads")
+    cookies = _fb_cookie_dict()
+    if cookies:
+        logger.info(f"fb_ads: cookies cargadas ({len(cookies)} entradas) "
+                    f"| curl_cffi={'sí' if _HAS_CFFI else 'no'}")
+    else:
+        logger.info(f"fb_ads: sin cookies de login | curl_cffi={'sí' if _HAS_CFFI else 'no'}")
+    return cookies, cookies_path
 
 
 def _fb_headers() -> dict:
@@ -535,8 +572,8 @@ def _fb_unescape(u: str) -> str:
     return u.replace("\\u0026", "&").replace("\\/", "/").replace("&amp;", "&")
 
 
-def _fb_download(session: requests.Session, url: str, ext: str = "mp4") -> str | None:
-    """Descarga un recurso (video/imagen) del CDN de Facebook usando la sesión."""
+def _fb_download(cookies: dict, url: str, ext: str = "mp4") -> str | None:
+    """Descarga un recurso (video/imagen) del CDN de Facebook."""
     try:
         tmp = os.path.join(tempfile.mkdtemp(), f"fbad.{ext}")
         hdrs = {
@@ -544,12 +581,26 @@ def _fb_download(session: requests.Session, url: str, ext: str = "mp4") -> str |
             "Accept": "*/*",
             "Referer": "https://www.facebook.com/ads/library/",
         }
-        with session.get(url, headers=hdrs, stream=True, timeout=120,
-                         proxies=PROXIES, verify=False) as r:
+        if _HAS_CFFI:
+            kw = {"headers": hdrs, "timeout": 120, "impersonate": FB_IMPERSONATE, "verify": False}
+            if cookies:
+                kw["cookies"] = cookies
+            if PROXY:
+                kw["proxies"] = {"http": PROXY, "https": PROXY}
+            r = cffi_requests.get(url, **kw)
             r.raise_for_status()
             with open(tmp, "wb") as f:
-                for chunk in r.iter_content(chunk_size=256 * 1024):
-                    f.write(chunk)
+                f.write(r.content)
+        else:
+            sess = requests.Session()
+            if cookies:
+                sess.cookies.update(cookies)
+            with sess.get(url, headers=hdrs, stream=True, timeout=120,
+                          proxies=PROXIES, verify=False) as r:
+                r.raise_for_status()
+                with open(tmp, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=256 * 1024):
+                        f.write(chunk)
         min_size = 10_000 if ext == "mp4" else 1_000
         if os.path.getsize(tmp) > min_size:
             return tmp
@@ -558,7 +609,7 @@ def _fb_download(session: requests.Session, url: str, ext: str = "mp4") -> str |
     return None
 
 
-def _scrape_fb_ads_html(ad_id: str, session: requests.Session) -> dict | None:
+def _scrape_fb_ads_html(ad_id: str, cookies: dict) -> dict | None:
     """
     Descarga el HTML de la página del anuncio y extrae del JSON embebido TODAS las
     URLs de video e imagen disponibles, además de metadatos básicos.
@@ -566,8 +617,7 @@ def _scrape_fb_ads_html(ad_id: str, session: requests.Session) -> dict | None:
     """
     page_url = f"https://www.facebook.com/ads/library/?id={ad_id}"
     try:
-        r = session.get(page_url, headers=_fb_headers(), timeout=30,
-                        proxies=PROXIES, verify=False)
+        r = _fb_get(page_url, cookies, _fb_headers(), timeout=30)
         if r.status_code != 200:
             logger.warning(f"fb_ads scrape: status {r.status_code}")
             return None
@@ -672,11 +722,11 @@ def download_facebook_ads(url: str) -> tuple[str | list[str] | None, dict | None
         "extractor_key": "FacebookAds",
     }
 
-    session, cookies = _fb_session()
+    cookies, cookies_path = _fb_session()
 
     # ── Intento 1: Scraping HTML (video + imágenes) ───────────────────
     logger.info(f"→ fb_ads scraping HTML para ID {ad_id}...")
-    scraped = _scrape_fb_ads_html(ad_id, session)
+    scraped = _scrape_fb_ads_html(ad_id, cookies)
 
     if scraped:
         snap = scraped.get("snapshot", {})
@@ -689,14 +739,14 @@ def download_facebook_ads(url: str) -> tuple[str | list[str] | None, dict | None
         # 1a. Video (preferimos hd, ya viene ordenado)
         for v_url in scraped["videos"]:
             logger.info(f"fb_ads: video URL → {v_url[:80]}...")
-            fp = _fb_download(session, v_url, "mp4")
+            fp = _fb_download(cookies, v_url, "mp4")
             if fp:
                 return fp, {**base_info, "ext": "mp4", "type": "video"}
 
         # 1b. Imágenes (anuncio de foto estática o carrusel)
         files = []
         for i_url in scraped["images"]:
-            fp = _fb_download(session, i_url, "jpg")
+            fp = _fb_download(cookies, i_url, "jpg")
             if fp:
                 files.append(fp)
         if files:
@@ -707,7 +757,7 @@ def download_facebook_ads(url: str) -> tuple[str | list[str] | None, dict | None
 
     # ── Intento 2: yt-dlp (solo video) ────────────────────────────────
     logger.info(f"→ fb_ads yt-dlp para ID {ad_id}...")
-    fp, info = _try_fb_ads_ytdlp(ad_id, cookies)
+    fp, info = _try_fb_ads_ytdlp(ad_id, cookies_path)
     if fp:
         if info:
             info.setdefault("extractor_key", "FacebookAds")
