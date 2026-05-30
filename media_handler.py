@@ -1,5 +1,7 @@
 import os
+import json
 import logging
+import subprocess
 from telegram import Update, InputMediaPhoto, InputMediaVideo, InputMediaAnimation
 from telegram.ext import ContextTypes
 from telegram.constants import ChatAction
@@ -14,6 +16,11 @@ MAX_FILE_SIZE_MB = 50
 # Límites de Telegram
 CAPTION_LIMIT = 1024   # caption de foto/video/animación
 TEXT_LIMIT    = 4096   # mensaje de texto normal
+
+# YouTube: ≤ 60s = Short, > 60s = formato largo (por duración real del video)
+SHORT_MAX_SECONDS = 60
+
+IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp")
 
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -68,11 +75,11 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         clean_url    = get_clean_url(info)
-        caption_text = format_message(platform, info, clean_url)
 
         # Twitter imagen: file_path puede ser "URL:https://..." para envío directo
         if isinstance(file_path, str) and file_path.startswith("URL:"):
             img_url = file_path[4:]
+            caption_text = format_message(platform, info, clean_url)
             await processing_msg.delete()
             media_caption, overflow = _split_caption(caption_text)
             await _safe_reply(update.message.reply_photo, photo=img_url, caption=media_caption)
@@ -83,8 +90,24 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
         ext = os.path.splitext(file_path)[1].lower()
 
+        # Metadatos reales del video (ancho/alto/duración) para que Telegram
+        # respete el aspect ratio y no lo muestre cuadrado o estirado.
+        width = height = duration = 0
+        if ext not in IMAGE_EXTS and ext != ".gif":
+            width, height, duration = _video_metadata(file_path, info)
+
+        # Reclasificar YouTube por DURACIÓN real: ≤60s = Short, >60s = largo.
+        # (youtu.be y watch?v= pueden ser cualquiera de los dos.)
+        if platform in ("youtube_short", "youtube_long") and duration:
+            platform = "youtube_short" if duration <= SHORT_MAX_SECONDS else "youtube_long"
+
+        caption_text = format_message(platform, info, clean_url)
+
         await processing_msg.delete()
-        await _send_single_file(update, file_path, ext, file_size_mb, caption_text)
+        await _send_single_file(
+            update, file_path, ext, file_size_mb, caption_text,
+            width=width, height=height, duration=duration,
+        )
 
     except Exception as e:
         logger.error(f"Error procesando {url}: {e}")
@@ -194,12 +217,13 @@ async def _handle_redgifs(update, processing_msg, url: str):
 # Helpers
 # ═══════════════════════════════════════════════════════════════════
 
-async def _send_single_file(update, file_path: str, ext: str, size_mb: float, caption: str):
+async def _send_single_file(update, file_path: str, ext: str, size_mb: float, caption: str,
+                            width: int = 0, height: int = 0, duration: int = 0):
     # Si el caption excede el límite de Telegram para media (1024), lo enviamos
     # como mensaje de texto aparte (que admite hasta 4096) y dejamos la media sin caption.
     media_caption, overflow = _split_caption(caption)
 
-    if ext in (".jpg", ".jpeg", ".png", ".webp"):
+    if ext in IMAGE_EXTS:
         with open(file_path, "rb") as f:
             await _safe_reply(update.message.reply_photo, photo=f, caption=media_caption)
     elif ext in (".gif",):
@@ -214,14 +238,59 @@ async def _send_single_file(update, file_path: str, ext: str, size_mb: float, ca
         await _send_long_text(update, warn)
         return
     else:
+        # Asegurar dimensiones para que Telegram respete el aspect ratio.
+        if not (width and height):
+            w, h, d = _ffprobe(file_path)
+            width    = width or w
+            height   = height or h
+            duration = duration or d
+        vkwargs = {"caption": media_caption, "supports_streaming": True}
+        if width:    vkwargs["width"]    = width
+        if height:   vkwargs["height"]   = height
+        if duration: vkwargs["duration"] = duration
         with open(file_path, "rb") as f:
-            await _safe_reply(
-                update.message.reply_video,
-                video=f, caption=media_caption, supports_streaming=True,
-            )
+            await _safe_reply(update.message.reply_video, video=f, **vkwargs)
 
     if overflow:
         await _send_long_text(update, overflow)
+
+
+def _ffprobe(file_path: str):
+    """Devuelve (width, height, duration_segundos) leyendo el archivo con ffprobe.
+    Si falla, devuelve (0, 0, 0)."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json",
+             "-show_streams", "-show_format", file_path],
+            capture_output=True, text=True, timeout=30,
+        )
+        data = json.loads(out.stdout or "{}")
+        duration = int(float(data.get("format", {}).get("duration", 0) or 0))
+        for s in data.get("streams", []):
+            if s.get("codec_type") == "video":
+                return (
+                    int(s.get("width", 0) or 0),
+                    int(s.get("height", 0) or 0),
+                    duration,
+                )
+        return 0, 0, duration
+    except Exception as e:
+        logger.warning(f"_ffprobe: {e}")
+        return 0, 0, 0
+
+
+def _video_metadata(file_path: str, info: dict):
+    """Combina los metadatos de yt-dlp (info) con ffprobe como respaldo.
+    Devuelve (width, height, duration)."""
+    width    = int(info.get("width") or 0)
+    height   = int(info.get("height") or 0)
+    duration = int(info.get("duration") or 0)
+    if not (width and height and duration):
+        w, h, d = _ffprobe(file_path)
+        width    = width or w
+        height   = height or h
+        duration = duration or d
+    return width, height, duration
 
 
 def _split_caption(caption: str):
