@@ -4,6 +4,7 @@ import re
 import tempfile
 import logging
 import requests
+import http.cookiejar
 import warnings
 warnings.filterwarnings("ignore", message="Unverified HTTPS request")
 
@@ -14,6 +15,7 @@ YOUTUBE_COOKIES   = os.environ.get("YOUTUBE_COOKIES",   None)
 REDDIT_COOKIES    = os.environ.get("REDDIT_COOKIES",    None)
 REDGIFS_COOKIES   = os.environ.get("REDGIFS_COOKIES",   None)
 TWITTER_COOKIES   = os.environ.get("TWITTER_COOKIES",   None)
+FACEBOOK_COOKIES  = os.environ.get("FACEBOOK_COOKIES",  None)
 COOKIES_FILE      = os.environ.get("COOKIES_FILE",      None)
 
 PROXY   = os.environ.get("PROXY_URL", "")
@@ -25,6 +27,7 @@ _PATHS = {
     "reddit":    "/tmp/rd_cookies.txt",
     "redgifs":   "/tmp/rg_cookies.txt",
     "twitter":   "/tmp/tw_cookies.txt",
+    "facebook":  "/tmp/fb_cookies.txt",
 }
 
 
@@ -80,6 +83,8 @@ def _cookies(platform: str) -> str | None:
         "reddit":        (REDDIT_COOKIES,    "reddit"),
         "redgifs":       (REDGIFS_COOKIES,   "redgifs"),
         "twitter":       (TWITTER_COOKIES,   "twitter"),
+        "facebook":      (FACEBOOK_COOKIES,  "facebook"),
+        "facebook_ads":  (FACEBOOK_COOKIES,  "facebook"),
     }
     if platform in mapping:
         content, key = mapping[platform]
@@ -477,70 +482,128 @@ def _extract_fb_ad_id(url: str) -> str | None:
     return m.group(1) if m else None
 
 
-def _scrape_fb_ads_html(ad_id: str) -> tuple[str | None, str | None, dict | None]:
+def _fb_session() -> tuple[requests.Session, str | None]:
     """
-    Hace fetch del HTML de la página de Ads Library y extrae las URLs MP4
-    directamente del JSON embebido, con todos los parámetros de autenticación.
-    Devuelve (video_hd_url, video_sd_url, snapshot_dict) o (None, None, None).
+    Crea una sesión de requests con las cookies de Facebook cargadas (si existen).
+    Las cookies de una sesión iniciada son lo que normalmente evita el 403 que
+    Facebook devuelve a peticiones automatizadas desde IPs de datacenter.
     """
-    page_url = f"https://www.facebook.com/ads/library/?id={ad_id}"
-    headers = {
+    session = requests.Session()
+    cookies_path = _cookies("facebook_ads")  # escribe el archivo Netscape y devuelve la ruta
+    if cookies_path and os.path.exists(cookies_path):
+        try:
+            cj = http.cookiejar.MozillaCookieJar()
+            cj.load(cookies_path, ignore_discard=True, ignore_expires=True)
+            session.cookies = cj
+            logger.info(f"fb_ads: cookies cargadas ({len(cj)} entradas)")
+        except Exception as e:
+            logger.warning(f"fb_ads: no se pudieron cargar cookies: {e}")
+    return session, cookies_path
+
+
+def _fb_headers() -> dict:
+    return {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/124.0.0.0 Safari/537.36"
         ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Sec-Fetch-Site": "none",
         "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+        "Cache-Control": "max-age=0",
     }
+
+
+def _fb_unescape(u: str) -> str:
+    return u.replace("\\u0026", "&").replace("\\/", "/").replace("&amp;", "&")
+
+
+def _fb_download(session: requests.Session, url: str, ext: str = "mp4") -> str | None:
+    """Descarga un recurso (video/imagen) del CDN de Facebook usando la sesión."""
     try:
-        r = requests.get(page_url, headers=headers, timeout=30,
-                         proxies=PROXIES, verify=False)
+        tmp = os.path.join(tempfile.mkdtemp(), f"fbad.{ext}")
+        hdrs = {
+            "User-Agent": _fb_headers()["User-Agent"],
+            "Accept": "*/*",
+            "Referer": "https://www.facebook.com/ads/library/",
+        }
+        with session.get(url, headers=hdrs, stream=True, timeout=120,
+                         proxies=PROXIES, verify=False) as r:
+            r.raise_for_status()
+            with open(tmp, "wb") as f:
+                for chunk in r.iter_content(chunk_size=256 * 1024):
+                    f.write(chunk)
+        min_size = 10_000 if ext == "mp4" else 1_000
+        if os.path.getsize(tmp) > min_size:
+            return tmp
+    except Exception as e:
+        logger.warning(f"_fb_download: {e}")
+    return None
+
+
+def _scrape_fb_ads_html(ad_id: str, session: requests.Session) -> dict | None:
+    """
+    Descarga el HTML de la página del anuncio y extrae del JSON embebido TODAS las
+    URLs de video e imagen disponibles, además de metadatos básicos.
+    Devuelve un dict {videos: [...], images: [...], snapshot: {...}} o None.
+    """
+    page_url = f"https://www.facebook.com/ads/library/?id={ad_id}"
+    try:
+        r = session.get(page_url, headers=_fb_headers(), timeout=30,
+                        proxies=PROXIES, verify=False)
         if r.status_code != 200:
             logger.warning(f"fb_ads scrape: status {r.status_code}")
-            return None, None, None
-
+            return None
         html = r.text
 
-        # Buscar video_hd_url y video_sd_url en el JSON embebido
-        hd_url = sd_url = None
+        # ── Videos: hd primero, sd después ────────────────────────────
+        videos = []
+        for pat in (r'"video_hd_url"\s*:\s*"(https:[^"]+?\.mp4[^"]*)"',
+                    r'"video_sd_url"\s*:\s*"(https:[^"]+?\.mp4[^"]*)"'):
+            for m in re.findall(pat, html):
+                videos.append(_fb_unescape(m))
 
-        # Patrón para video_hd_url con parámetros completos
-        hd_match = re.search(
-            r'"video_hd_url"\s*:\s*"(https://[^"]+\.mp4[^"]*)"',
-            html
-        )
-        if hd_match:
-            hd_url = hd_match.group(1).replace("\\u0026", "&").replace("\\/", "/")
+        # ── Imágenes: preferir original; usar resized solo si no hay original ──
+        # (Facebook da original_image_url y resized_image_url de la MISMA foto,
+        #  así que tomar ambas duplicaría cada imagen.)
+        originals = [_fb_unescape(m) for m in
+                     re.findall(r'"original_image_url"\s*:\s*"(https:[^"]+?)"', html)]
+        resized   = [_fb_unescape(m) for m in
+                     re.findall(r'"resized_image_url"\s*:\s*"(https:[^"]+?)"', html)]
+        images = [u for u in (originals or resized) if ".mp4" not in u]
 
-        sd_match = re.search(
-            r'"video_sd_url"\s*:\s*"(https://[^"]+\.mp4[^"]*)"',
-            html
-        )
-        if sd_match:
-            sd_url = sd_match.group(1).replace("\\u0026", "&").replace("\\/", "/")
+        # Dedupe conservando el orden
+        videos = list(dict.fromkeys(videos))
+        images = list(dict.fromkeys(images))
 
-        # Extraer info básica del anuncio (página, texto del body)
+        # ── Metadatos ─────────────────────────────────────────────────
         snapshot = {}
-        page_name_m = re.search(r'"page_name"\s*:\s*"([^"]+)"', html)
-        if page_name_m:
-            snapshot["page_name"] = page_name_m.group(1)
+        m = re.search(r'"page_name"\s*:\s*"([^"]+)"', html)
+        if m:
+            snapshot["page_name"] = _fb_unescape(m.group(1))
+        m = re.search(r'"body"\s*:\s*\{\s*"text"\s*:\s*"([^"]*)"', html)
+        if m:
+            snapshot["body_text"] = _fb_unescape(m.group(1)).replace("\\n", "\n")
 
-        body_m = re.search(r'"body"\s*:\s*\{\s*"text"\s*:\s*"([^"]*)"', html)
-        if body_m:
-            snapshot["body_text"] = body_m.group(1).replace("\\n", "\n")
+        if not videos and not images:
+            logger.warning(f"fb_ads scrape: HTML OK pero sin media para {ad_id}")
+            return None
 
-        return hd_url, sd_url, snapshot
+        logger.info(f"fb_ads scrape: {len(videos)} video(s), {len(images)} imagen(es)")
+        return {"videos": videos, "images": images, "snapshot": snapshot}
 
     except Exception as e:
         logger.warning(f"_scrape_fb_ads_html: {e}")
-        return None, None, None
+        return None
 
 
-def _try_fb_ads_ytdlp(ad_id: str) -> tuple[str | None, dict | None]:
-    """Intenta descargar el video con yt-dlp directamente desde la URL del anuncio."""
+def _try_fb_ads_ytdlp(ad_id: str, cookies: str | None) -> tuple[str | None, dict | None]:
+    """Fallback: intenta descargar el video con yt-dlp (solo sirve para video)."""
     page_url = f"https://www.facebook.com/ads/library/?id={ad_id}"
     tmp_dir = tempfile.mkdtemp()
     opts = {
@@ -555,6 +618,8 @@ def _try_fb_ads_ytdlp(ad_id: str) -> tuple[str | None, dict | None]:
     }
     if PROXY:
         opts["proxy"] = PROXY
+    if cookies:
+        opts["cookiefile"] = cookies
     try:
         logger.info(f"→ yt-dlp fb_ads [{ad_id}]...")
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -564,17 +629,23 @@ def _try_fb_ads_ytdlp(ad_id: str) -> tuple[str | None, dict | None]:
                 if os.path.isfile(fp) and os.path.getsize(fp) > 10_000:
                     return fp, info
     except Exception as e:
-        logger.warning(f"_try_fb_ads_ytdlp: {e}")
+        logger.warning(f"_try_fb_ads_ytdlp: {str(e)[:140]}")
     return None, None
 
 
-def download_facebook_ads(url: str) -> tuple[str | None, dict | None]:
+def download_facebook_ads(url: str) -> tuple[str | list[str] | None, dict | None]:
     """
-    Descarga el video de un anuncio de Facebook Ads Library.
+    Descarga el contenido (video O imágenes) de un anuncio de Facebook Ads Library.
+
+    Devuelve:
+      - (str, info)        → un solo video o una sola imagen
+      - (list[str], info)  → varias imágenes (anuncio carrusel)
+      - (None, None)       → error
+
     Orden de intentos:
-      1. Scraping HTML → URL directa con parámetros de auth completos
-      2. yt-dlp directo en la URL del anuncio
-      3. Cobalt (fallback genérico)
+      1. Scraping HTML con sesión + cookies → URLs directas de video/imagen
+      2. yt-dlp (solo video)
+      3. Cobalt (solo video, fallback genérico)
     """
     ad_id = _extract_fb_ad_id(url)
     if not ad_id:
@@ -589,35 +660,54 @@ def download_facebook_ads(url: str) -> tuple[str | None, dict | None]:
         "extractor_key": "FacebookAds",
     }
 
-    # ── Intento 1: Scraping HTML ──────────────────────────────────
+    session, cookies = _fb_session()
+
+    # ── Intento 1: Scraping HTML (video + imágenes) ───────────────────
     logger.info(f"→ fb_ads scraping HTML para ID {ad_id}...")
-    hd_url, sd_url, snapshot = _scrape_fb_ads_html(ad_id)
+    scraped = _scrape_fb_ads_html(ad_id, session)
 
-    video_url = hd_url or sd_url
-    if video_url:
-        logger.info(f"fb_ads: URL extraída del HTML → {video_url[:80]}...")
-        fp = _download_direct_url(video_url, "mp4")
-        if fp:
-            if snapshot:
-                base_info["title"]       = f"Anuncio de {snapshot.get('page_name', 'Facebook')} #{ad_id}"
-                base_info["description"] = snapshot.get("body_text", "")
-                base_info["page_name"]   = snapshot.get("page_name", "")
-            return fp, base_info
+    if scraped:
+        snap = scraped.get("snapshot", {})
+        if snap.get("page_name"):
+            base_info["title"]     = f"Anuncio de {snap['page_name']} #{ad_id}"
+            base_info["page_name"] = snap["page_name"]
+        if snap.get("body_text"):
+            base_info["description"] = snap["body_text"]
 
-    # ── Intento 2: yt-dlp ────────────────────────────────────────
+        # 1a. Video (preferimos hd, ya viene ordenado)
+        for v_url in scraped["videos"]:
+            logger.info(f"fb_ads: video URL → {v_url[:80]}...")
+            fp = _fb_download(session, v_url, "mp4")
+            if fp:
+                return fp, {**base_info, "ext": "mp4", "type": "video"}
+
+        # 1b. Imágenes (anuncio de foto estática o carrusel)
+        files = []
+        for i_url in scraped["images"]:
+            fp = _fb_download(session, i_url, "jpg")
+            if fp:
+                files.append(fp)
+        if files:
+            info = {**base_info, "ext": "jpg",
+                    "type": "gallery" if len(files) > 1 else "image",
+                    "count": len(files)}
+            return (files if len(files) > 1 else files[0]), info
+
+    # ── Intento 2: yt-dlp (solo video) ────────────────────────────────
     logger.info(f"→ fb_ads yt-dlp para ID {ad_id}...")
-    fp, info = _try_fb_ads_ytdlp(ad_id)
+    fp, info = _try_fb_ads_ytdlp(ad_id, cookies)
     if fp:
         if info:
             info.setdefault("extractor_key", "FacebookAds")
-        return fp, info or base_info
+            info.setdefault("type", "video")
+        return fp, info or {**base_info, "type": "video"}
 
-    # ── Intento 3: Cobalt ────────────────────────────────────────
+    # ── Intento 3: Cobalt (solo video) ────────────────────────────────
     logger.info(f"→ fb_ads cobalt para ID {ad_id}...")
     lib_url = f"https://www.facebook.com/ads/library/?id={ad_id}"
     fp, cobalt_info = _try_cobalt(lib_url)
     if fp:
-        return fp, cobalt_info or base_info
+        return fp, cobalt_info or {**base_info, "type": "video"}
 
     logger.error(f"download_facebook_ads: todos los métodos fallaron para {ad_id}")
     return None, None
