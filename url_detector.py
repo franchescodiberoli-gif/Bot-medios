@@ -10,6 +10,9 @@ PLATFORM_PATTERNS = {
         r"vm\.tiktok\.com\/",
         r"vt\.tiktok\.com\/",
     ],
+    "facebook_ads": [
+        r"facebook\.com\/ads\/library\/",
+    ],
     "facebook": [
         r"facebook\.com\/(watch|reel|video\.php)",
         r"facebook\.com\/share\/(v|p|r|reels)\/",
