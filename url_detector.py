@@ -19,9 +19,9 @@ PLATFORM_PATTERNS = {
     ],
     "youtube_short": [
         r"youtube\.com\/shorts\/",
-        r"youtu\.be\/",
     ],
     "youtube_long": [
+        r"youtu\.be\/",
         r"youtube\.com\/watch\?v=",
         r"youtube\.com\/live\/",
         r"youtube\.com\/embed\/",
